@@ -1,0 +1,39 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
+
+# Virtual environments
+.venv/
+venv/
+env/
+.envrc
+poetry.lock
+Pipfile.lock
+
+# Environment & secrets
+.env
+*.env
+*.key
+*.pem
+*.p12
+*.crt
+.DS_Store
+
+# Local data & indexes
+teach_db/
+data/vectordb/
+*.faiss
+*.index
+
+# IDE / notebook noise
+.ipynb_checkpoints/
+.vscode/
+*.swp
+
+# Generated static assets
+static/dist/

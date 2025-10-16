@@ -1,0 +1,18 @@
+name: wx-langgraph-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - ipykernel
+  - jupyterlab
+  - ipython
+  - pydantic>=2
+  - typing_extensions
+  - pip:
+      - ibm-watsonx-ai
+      - langchain-core
+      - langchain-ibm
+      - langgraph
+      - python-dotenv

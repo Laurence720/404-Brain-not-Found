@@ -1,0 +1,20 @@
+{
+  "user_id": "n0PDJMIKZQc2nMWS9pMcHp4TahX2Uuvypi7W7HqZTR8=",
+  "name": "张总",
+  "email": "h-NOgeZh35_bMPHMTtxasUjmkYjV86sF_6-9wxQ33Lvkv86bfxOaVAE713mjrtfF",
+  "phone": "AMLC87LEAAdusLSpYw2e8vcx9kn3a7_2RExsqI2picw=",
+  "risk_level": "conservative",
+  "preferences": {
+    "sectors": [
+      "科技",
+      "金融"
+    ],
+    "esg": true,
+    "max_single_weight": 0.3
+  },
+  "sensitive_data": {
+    "ssn": "123-45-6789",
+    "bank_account": "6222021234567890",
+    "credit_card": "4532-1234-5678-9012"
+  }
+}
