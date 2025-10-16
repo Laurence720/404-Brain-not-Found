@@ -140,7 +140,6 @@ from formula_tool import generate_formula_card
 from worked_example_tool import generate_worked_example
 from pitfalls_tool import generate_pitfalls_card
 from quiz_tool import generate_quiz_card
-from general_plan import general_plan_node, route_from_general_plan, configure_general_plan
 news_fetcher = NewsFetcher(provider_priority=["finnhub","polygon","fmp","newsapi","marketaux"])
 trend_fetcher = NewsFetcher(provider_priority=["newsapi", "finnhub"])
 pii_protector = SmartPIIProtector()
@@ -176,8 +175,6 @@ except Exception:
 # =============================================
 # Defaults / Persona
 # =============================================
-_MIN_CANDIDATE_COUNT = 5
-
 _DEFAULT_PERSONA = {
     "user_id": "demo_user",
     "risk_level": "medium",  # low/medium/high
@@ -747,10 +744,7 @@ def allocate_node(state: MessagesState):
 
     tickers: List[str] = facts.get("tickers", [])
     scores: Dict[str, int] = analysis.get("scores", {})
-    raw_target = facts.get("target_extra_allocation")
-    if not isinstance(raw_target, (int, float)) or raw_target <= 0:
-        raw_target = 0.3
-    target = float(raw_target)
+    target = float(facts.get("target_extra_allocation") or 0.0)
     cap = float(facts.get("max_single_weight", 0.15))
     chosen = selection.get("chosen") if isinstance(selection.get("chosen"), list) else []
     rationale = selection.get("rationale") if isinstance(selection.get("rationale"), dict) else {}
@@ -809,74 +803,46 @@ def allocate_node(state: MessagesState):
     human = HumanMessage(content=f"ALLOCATE_INPUT_JSON: {json.dumps(alloc_input, ensure_ascii=False)}")
     ai = _llm_invoke_with_log(llm, state["messages"] + [sys, human], "allocate")
     picked = _extract_json_from_text(ai.content) or {"allocation": {}}
-    raw_alloc: Dict[str, float] = {}
+    alloc: Dict[str, float] = {}
     alloc_reason: Dict[str, str] = {}
-    order = [item["ticker"] for item in candidate_bundle]
+    s = 0.0
     for t, w in (picked.get("allocation") or {}).items():
-        if t not in order:
-            continue
-        risk_info = risk_excluded_map.get(t) if isinstance(risk_excluded_map.get(t), dict) else None
-        if risk_info and risk_level == "low" and risk_info.get("code") == "beta_too_high":
-            print(f"[allocate-skip] {t} allocation blocked due to beta requirement")
-            continue
         try:
-            raw_alloc[t] = float(w)
+            w = float(w)
         except Exception:
             continue
+        if t in chosen:
+            risk_info = risk_excluded_map.get(t) if isinstance(risk_excluded_map.get(t), dict) else None
+            if risk_info and risk_level == "low" and risk_info.get("code") == "beta_too_high":
+                print(f"[allocate-skip] {t} allocation blocked due to beta requirement")
+                continue
+            v = max(0.0, min(cap, w))
+            alloc[t] = v
+            s += v
     for t, reason in (picked.get("rationale") or {}).items():
-        if t in order:
+        if t in chosen:
             alloc_reason[t] = str(reason)[:200]
 
-    alloc = _normalize_allocation(raw_alloc, order, target, cap)
+    # Safety/fallback: if empty or sum!=target, build from top scores deterministically
+    if not alloc or s <= 1e-12:
+        # choose top-k by score (k between 3 and 6)
+        top = sorted([(t, scores.get(t, 50)) for t in chosen], key=lambda x: x[1], reverse=True)
+        k = min(6, max(3, len(top)))
+        chosen = [t for t, _ in top[:k]]
+        alloc = _build_suggested_weights(chosen, target, cap)
+        s = sum(alloc.values())
+        alloc_reason = {t: rationale.get(t, "Backtest weight generated from scores") for t in alloc}
 
-    if not alloc:
-        # deterministic fallback on top scores
-        fallback_order = [item["ticker"] for item in sorted(
-            ((t, scores.get(t, 50)) for t in order), key=lambda x: x[1], reverse=True
-        )]
-        fallback_order = fallback_order[: max(3, min(6, len(fallback_order)))] or order
-        alloc = _build_suggested_weights(fallback_order, target, cap)
-        alloc = _normalize_allocation(alloc, fallback_order, target, cap)
-        alloc_reason = {t: rationale.get(t, "Score-based allocation")[:200] for t in alloc}
-
-    for t in list(alloc_reason.keys()):
-        if t not in alloc:
-            alloc_reason.pop(t, None)
-
-    for t in alloc:
-        if t not in alloc_reason:
-            alloc_reason[t] = rationale.get(t, "Weight assigned per score and risk")[:200]
+    if s > 0 and abs(s - target) > 1e-6:
+        scale = target / s
+        for t in list(alloc.keys()):
+            alloc[t] = min(cap, alloc[t] * scale)
 
     for t in alloc:
         print(f"[allocation-weight] {t}: weight={alloc[t]:.4f} score={scores.get(t, 0)} reason={alloc_reason.get(t, '')}")
 
     payload = {"allocation": alloc, "rationale": alloc_reason}
     return {"messages": [HumanMessage(content=f"PICKS_JSON: {json.dumps(payload, ensure_ascii=False)}")]}
-
-
-def summary_node(state: MessagesState):
-    print(f"[call] {inspect.currentframe().f_code.co_name}")
-    llm = build_llm()
-    facts = _get_json(state, "FACTS_JSON")
-    analysis = _get_json(state, "ANALYSIS_JSON")
-    selection = _get_json(state, "SELECTION_JSON")
-    picks = _get_json(state, "PICKS_JSON")
-    summary_payload = {
-        "facts": facts,
-        "analysis": analysis,
-        "selection": selection,
-        "picks": picks,
-    }
-    sys = SystemMessage(content=(
-        "You are a professional investment analyst. Based on the provided allocation data, craft an unrestricted narrative summary."
-    ))
-    human = HumanMessage(content=f"SUMMARY_SOURCE_JSON: {json.dumps(summary_payload, ensure_ascii=False)}")
-    try:
-        ai = _llm_invoke_with_log(llm, state["messages"] + [sys, human], "final-summary")
-        content = ai.content.strip()
-    except Exception as exc:
-        content = f"Summary unavailable: {exc}"
-    return {"messages": [AIMessage(content=content)]}
 
 
 # =============================================
@@ -913,220 +879,6 @@ def _first_sentence(text: Optional[str]) -> str:
             return s[: idx + 1].strip()
     # Fallback: truncate
     return s[:120].strip()
-
-
-def _fmt_percent(value: Optional[float]) -> str:
-    if isinstance(value, (int, float)):
-        return f"{value * 100:.2f}%"
-    return "n/a"
-
-
-def _fmt_number(value: Optional[float]) -> str:
-    if isinstance(value, (int, float)):
-        return f"{value:.2f}"
-    return "n/a"
-
-
-def _risk_alignment_score(metrics: Mapping[str, Any], policy: Mapping[str, Any]) -> float:
-    if not isinstance(metrics, Mapping):
-        return float("-inf")
-    if not isinstance(policy, Mapping):
-        policy = {}
-
-    score = 0.0
-    penalty = 0.0
-    checks = 0
-
-    vol = metrics.get("ann_vol")
-    if isinstance(vol, (int, float)):
-        vol = float(vol)
-        upper = policy.get("ann_vol_max")
-        lower = policy.get("ann_vol_min")
-        if isinstance(upper, (int, float)) and upper > 0:
-            checks += 1
-            if vol <= upper:
-                score += 0.3
-            else:
-                penalty += max(0.0, (vol - upper) / upper)
-        if isinstance(lower, (int, float)) and lower > 0:
-            checks += 1
-            if vol >= lower:
-                score += 0.2
-            else:
-                penalty += max(0.0, (lower - vol) / lower)
-
-    beta = metrics.get("beta")
-    if isinstance(beta, (int, float)):
-        beta = float(beta)
-        upper = policy.get("beta_max")
-        lower = policy.get("beta_min")
-        if isinstance(upper, (int, float)):
-            checks += 1
-            if beta <= upper:
-                score += 0.3
-            else:
-                penalty += max(0.0, (beta - upper) / max(abs(upper), 1e-6))
-        if isinstance(lower, (int, float)):
-            checks += 1
-            if beta >= lower:
-                score += 0.2
-            else:
-                penalty += max(0.0, (lower - beta) / max(abs(lower), 1e-6))
-
-    mdd = metrics.get("mdd_6m")
-    if isinstance(mdd, (int, float)):
-        mdd = float(mdd)
-        limit = policy.get("max_drawdown_6m")
-        if isinstance(limit, (int, float)) and limit > 0:
-            checks += 1
-            if mdd <= limit:
-                score += 0.2
-            else:
-                penalty += max(0.0, (mdd - limit) / limit)
-
-    ret6 = metrics.get("ret_6m")
-    if isinstance(ret6, (int, float)):
-        score += 0.1 * float(ret6)
-
-    if checks:
-        score -= penalty / checks
-    else:
-        score -= penalty
-    return score
-
-
-def _fallback_from_facts(facts: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    if not isinstance(facts, Mapping):
-        return None
-    risk = facts.get("risk")
-    if not isinstance(risk, Mapping):
-        return None
-    metrics = risk.get("metrics")
-    policy = risk.get("policy")
-    if not isinstance(metrics, Mapping):
-        metrics = {}
-    if not isinstance(policy, Mapping):
-        policy = {}
-    kept = risk.get("kept")
-    kept_list = [t for t in (kept or []) if isinstance(t, str)]
-    risk_level = str(((risk.get("params") or {}).get("risk_level") or "medium")).lower()
-
-    fallback_ticker: Optional[str] = None
-    fallback_metrics: Optional[Mapping[str, Any]] = None
-
-    if kept_list:
-        fallback_ticker = kept_list[0]
-        fallback_metrics = metrics.get(fallback_ticker) if isinstance(metrics, Mapping) else None
-    else:
-        scored: List[tuple[float, str, Mapping[str, Any]]] = []
-        for ticker, met in metrics.items():
-            if not isinstance(met, Mapping):
-                continue
-            score = _risk_alignment_score(met, policy)
-            scored.append((score, ticker, met))
-        if scored:
-            scored.sort(key=lambda item: item[0], reverse=True)
-            _, fallback_ticker, fallback_metrics = scored[0]
-
-    if not fallback_ticker:
-        tickers = facts.get("tickers")
-        if isinstance(tickers, list) and tickers:
-            fallback_ticker = tickers[0]
-            fallback_metrics = metrics.get(fallback_ticker) if isinstance(metrics, Mapping) else None
-
-    if not fallback_ticker:
-        return None
-
-    risk_level_display = risk_level.capitalize() if isinstance(risk_level, str) else "Medium"
-    lines = [
-        "Plan routing stalled, so I selected the most risk-aligned ticker from the latest risk assessment table instead of stopping with an error.",
-        f"Recommended ticker: {fallback_ticker}",
-        f"- Risk preference: {risk_level_display}",
-    ]
-    if isinstance(fallback_metrics, Mapping):
-        lines.extend([
-            f"- Annualized volatility: {_fmt_percent(fallback_metrics.get('ann_vol'))}",
-            f"- Beta vs benchmark: {_fmt_number(fallback_metrics.get('beta'))}",
-            f"- 6M max drawdown: {_fmt_percent(fallback_metrics.get('mdd_6m'))}",
-            f"- 6M return: {_fmt_percent(fallback_metrics.get('ret_6m'))}",
-        ])
-
-    return {
-        "ticker": fallback_ticker,
-        "metrics": dict(fallback_metrics or {}),
-        "message": "\n".join(lines),
-        "risk_level": risk_level,
-    }
-
-
-def _select_best_teach_topic(
-    llm: Any,
-    candidates: List[str],
-    context: str,
-) -> tuple[Optional[str], List[str], Optional[str]]:
-    """
-    Ask the LLM to rank candidate teaching topics by financial education value.
-    Returns (best_topic, ranking, reason).
-    """
-    if llm is None or not candidates:
-        return None, [], None
-
-    unique_candidates: List[str] = []
-    for term in candidates:
-        text = str(term or "").strip()
-        if text and text not in unique_candidates:
-            unique_candidates.append(text)
-        if len(unique_candidates) >= 5:
-            break
-
-    if not unique_candidates:
-        return None, [], None
-    if len(unique_candidates) == 1:
-        return unique_candidates[0], unique_candidates[:], None
-
-    snippet = (context or "").strip()
-    if len(snippet) > 1200:
-        snippet = snippet[:1200]
-
-    sys_msg = SystemMessage(content=(
-        "You are a senior financial education advisor. Review the candidate terms and context, then decide which term delivers the greatest educational value for an investing audience."
-        "Return a strict JSON object with this schema:"
-        "{"
-        "\"best\": \"best term (must come from the candidate list)\", "
-        "\"ranking\": [\"all candidates ordered from most to least educational value\"], "
-        "\"reason\": \"<=50 words explaining why the best term was chosen\""
-        "}. Do not invent new terms."
-    ))
-    human_lines = ["Candidate terms:"]
-    human_lines.extend(f"- {term}" for term in unique_candidates)
-    if snippet:
-        human_lines.append("\nSupporting context (optional):")
-        human_lines.append(snippet)
-    else:
-        human_lines.append("\nSupporting context: not provided.")
-    human_msg = HumanMessage(content="\n".join(human_lines))
-
-    ai = _llm_invoke_with_log(llm, [sys_msg, human_msg], "teach-topic-select")
-    content = getattr(ai, "content", "") or ""
-    parsed = _extract_json_from_text(content) or {}
-
-    best = str(parsed.get("best") or "").strip()
-    ranking_raw = parsed.get("ranking")
-    if isinstance(ranking_raw, list):
-        ranking = [str(item).strip() for item in ranking_raw if str(item or "").strip() in unique_candidates]
-    else:
-        ranking = []
-
-    if not best and ranking:
-        best = ranking[0]
-    if best and best not in unique_candidates:
-        best = ""
-
-    reason = str(parsed.get("reason") or "").strip()
-    if not reason:
-        reason = None
-
-    return (best or None, ranking, reason)
 
 
 def _news_preview(text: Optional[str], max_sentences: int = 2, max_chars: int = 320) -> str:
@@ -1168,10 +920,6 @@ _TICKER_STOPWORDS = {
     "TECH", "AI", "IPO", "CEO", "EV", "FDA", "EPS", "GDP", "CPI", "PCE",
     "DATA", "NEWS", "MARKET", "INDEX", "STOCK", "STOCKS",
     "STUB", "SMALL", "CAP", "HONG", "KONG", "RED", "CHIP", "CHIPS",
-    "CHECK", "PRICE", "QUOTE", "LATEST", "UPDATE", "INFO", "SHARE", "SHARES",
-    "I", "WANT", "TO", "KNOW", "ABOUT", "PLEASE", "HELP", "NEED", "WHAT", "TELL",
-    "OF", "ON", "IN", "FOR", "MY", "ME", "PLEASE", "SHOW", "SOME",
-    "DO", "YOU", "YOUR", "KNOW", "OK",
 }
 
 _RECOMMEND_KEYWORDS = {
@@ -1220,8 +968,6 @@ def _is_valid_ticker(token: Optional[str]) -> bool:
         return False
     t = str(token).upper()
     if t in _TICKER_STOPWORDS:
-        return False
-    if t in DELISTED_TICKERS:
         return False
     if not re.fullmatch(r"[A-Z]{1,5}", t):
         return False
@@ -1741,76 +1487,6 @@ def _build_suggested_weights(
     return w
 
 
-def _normalize_allocation(
-    raw_weights: Dict[str, float],
-    tickers: List[str],
-    target: float,
-    cap: float,
-) -> Dict[str, float]:
-    """Apply cap + normalization in one place to avoid double truths."""
-    if target <= 0 or not tickers:
-        return {}
-    ordered = [t for t in tickers if t in raw_weights]
-    if not ordered:
-        ordered = list(tickers)
-    clean: Dict[str, float] = {}
-    for t in ordered:
-        try:
-            w = float(raw_weights.get(t, 0.0))
-        except Exception:
-            w = 0.0
-        if w <= 0:
-            continue
-        clean[t] = min(cap, max(0.0, w))
-
-    if not clean:
-        return {}
-
-    def _total() -> float:
-        return sum(clean.values())
-
-    total = _total()
-    if total <= 1e-9:
-        return {}
-
-    # If sum exceeds target, shrink proportionally (respecting cap already applied).
-    if total > target + 1e-9:
-        scale = target / total
-        for t in list(clean.keys()):
-            clean[t] = min(cap, clean[t] * scale)
-        total = _total()
-
-    # If sum below target, try to top up proportionally until target reached or caps hit.
-    if total < target - 1e-6:
-        remain = target - total
-        for _ in range(4):  # limited passes
-            flex = [t for t in clean if clean[t] < cap - 1e-9]
-            if not flex or remain <= 1e-6:
-                break
-            add = remain / len(flex)
-            updated = False
-            for t in flex:
-                delta = min(cap - clean[t], add)
-                if delta > 1e-9:
-                    clean[t] += delta
-                    remain -= delta
-                    updated = True
-            if not updated:
-                break
-        total = _total()
-
-    # Final proportional scaling if we still overshoot a hair.
-    if total > target + 1e-6:
-        scale = target / total
-        for t in list(clean.keys()):
-            clean[t] = min(cap, clean[t] * scale)
-        total = _total()
-
-    # Drop negligible weights and round tiny eps.
-    final = {t: round(w, 10) for t, w in clean.items() if w > 1e-8}
-    return final
-
-
 # =============================================
 # NODES (LangGraph)
 # =============================================
@@ -1830,8 +1506,6 @@ def teach_node(state: MessagesState):
     user_q = (latest_user.content if isinstance(latest_user, HumanMessage) else "").strip()
     latest_plan = next((m for m in reversed(state["messages"]) if isinstance(m, AIMessage)), None)
     plan_text = str(latest_plan.content).strip() if isinstance(latest_plan, AIMessage) else ""
-
-    out_messages: List[Any] = []
 
     jargon_data = _get_json(state, "JARGON_JSON")
     jargon_terms: List[str] = []
@@ -1855,87 +1529,16 @@ def teach_node(state: MessagesState):
         ),
         topic_lines[0] if topic_lines else "Investing fundamentals",
     )[:80]
-    sections: List[str] = []
-    summary_section = next((sec for sec in sections if sec), "")
-    extracted_terms: List[str] = []
-    term_match = re.findall(r"\b([A-Z]{2,5})\b", summary_section)
-    for tok in term_match:
-        if _is_valid_ticker(tok):
-            extracted_terms.append(tok)
-    teaching_topics = []
-    if extracted_terms:
-        teaching_topics.extend(extracted_terms[:3])
-    teaching_topics.extend([t for t in jargon_terms if t not in teaching_topics])
+    teaching_topics = [t for t in jargon_terms[:3] if t]
     if not teaching_topics:
-        teaching_topics.append(fallback_topic)
+        teaching_topics = [fallback_topic]
     combined_context = (f"User question:\n{user_q}\n\nModel response:\n{plan_text}").strip()
+
+    sections: List[str] = []
     tool_errors: List[str] = []
 
-    if not isinstance(jargon_data, dict):
-        jargon_data = {}
-
-    if isinstance(jargon_data, list):
-        tmp_terms: List[str] = []
-        tmp_notes: Dict[str, str] = {}
-        for item in jargon_data:
-            if isinstance(item, dict):
-                tmp_terms.extend(item.get("terms") or [])
-                tmp_notes.update(item.get("notes") or {})
-        jargon_terms = [str(t).strip()[:80] for t in tmp_terms if str(t).strip()]
-        jargon_notes = {str(k): str(v)[:160] for k, v in tmp_notes.items()}
-
-    analysis = _get_json(state, "ANALYSIS_JSON")
-    selection = _get_json(state, "SELECTION_JSON")
-    selection_rationale = selection.get("rationale", {}) if isinstance(selection, dict) else {}
-    analysis_notes = analysis.get("notes", {}) if isinstance(analysis, dict) else {}
-    scores = analysis.get("scores", {}) if isinstance(analysis, dict) else {}
-    chosen = selection.get("chosen", []) if isinstance(selection, dict) else []
-    excluded = selection.get("excluded", {}) if isinstance(selection, dict) else {}
-    risk_excluded = selection.get("risk_excluded", {}) if isinstance(selection, dict) else {}
-    facts = _get_json(state, "FACTS_JSON")
-    risk_data = facts.get("risk") if isinstance(facts, dict) else {}
-    risk_metrics = (risk_data or {}).get("metrics") or {}
-
-    plan_summary = ""
-    if selection_rationale or plan_text:
-        llm = build_llm()
-        summary_payload = {
-            "plan_text": plan_text,
-            "selection": {
-                "chosen": [
-                    {
-                        "ticker": t,
-                        "score": scores.get(t),
-                        "selection_rationale": selection_rationale.get(t),
-                        "analysis_note": analysis_notes.get(t),
-                        "risk_metrics": risk_metrics.get(t),
-                    }
-                    for t in chosen
-                ],
-                "excluded": [
-                    {
-                        "ticker": t,
-                        "reason": excluded.get(t),
-                        "risk_note": (risk_excluded.get(t) or {}).get("message"),
-                        "analysis_note": analysis_notes.get(t),
-                        "score": scores.get(t),
-                    }
-                    for t in excluded
-                ],
-            },
-        }
-        summary_sys = SystemMessage(content=(
-            "You are a sell-side equity analyst. Use the provided selection payload to craft a narrative briefing for the PM."
-        ))
-        summary_human = HumanMessage(content=f"PLAN_SUMMARY_JSON: {json.dumps(summary_payload, ensure_ascii=False)}")
-        try:
-            plan_ai = _llm_invoke_with_log(llm, state["messages"] + [summary_sys, summary_human], "teach-plan-summary")
-            plan_summary = plan_ai.content.strip()
-        except Exception as exc:
-            plan_summary = plan_text or ""
-            tool_errors.append(f"plan_summary_llm_failed: {exc}")
-        if plan_summary:
-            sections.append(plan_summary.strip())
+    if plan_text:
+        sections.append("### Investment Plan\n" + plan_text)
     if jargon_terms:
         vocab_lines = ["### Vocabulary Highlights"]
         for term in teaching_topics:
@@ -1953,64 +1556,12 @@ def teach_node(state: MessagesState):
             tool_errors.append(f"{label}: {exc}")
             return None
 
-    topic_selection_reason: Optional[str] = None
-    topic_ranking: List[str] = []
-    focus_topic: Optional[str] = None
-
     try:
         teaching_llm = build_llm()
     except Exception:
         teaching_llm = None
 
-    if teaching_llm:
-        candidate_pool: List[str] = []
-        for term in teaching_topics:
-            text = str(term or "").strip()
-            if text and text not in candidate_pool:
-                candidate_pool.append(text)
-            if len(candidate_pool) >= 5:
-                break
-        if len(candidate_pool) > 1:
-            try:
-                best_topic, ranked_topics, reason = _select_best_teach_topic(
-                    teaching_llm,
-                    candidate_pool,
-                    combined_context,
-                )
-            except Exception as exc:
-                tool_errors.append(f"topic_select_failed: {exc}")
-            else:
-                if ranked_topics:
-                    topic_ranking = ranked_topics
-                    ranked_filtered = [t for t in ranked_topics if t in teaching_topics]
-                    if ranked_filtered:
-                        teaching_topics = ranked_filtered + [t for t in teaching_topics if t not in ranked_filtered]
-                if best_topic and best_topic in teaching_topics:
-                    focus_topic = best_topic
-                    teaching_topics = [best_topic] + [t for t in teaching_topics if t != best_topic]
-                if reason:
-                    topic_selection_reason = reason
-
-    if focus_topic is None:
-        focus_topic = teaching_topics[0] if teaching_topics else fallback_topic
-
-    concept_topics: List[str] = [focus_topic] if focus_topic else []
-
-    other_candidates: List[str] = []
-    if topic_ranking:
-        other_candidates = [t for t in topic_ranking if t != focus_topic]
-    else:
-        other_candidates = [t for t in teaching_topics if t != focus_topic][:4]
-
-    if focus_topic:
-        focus_lines = [f"- Highlighted term: {focus_topic}"]
-        if topic_selection_reason:
-            focus_lines.append(f"- Rationale: {topic_selection_reason}")
-        if other_candidates:
-            focus_lines.append(f"- Other candidates: {', '.join(other_candidates)}")
-        sections.append("### Teaching Focus\n" + "\n".join(focus_lines))
-
-    for idx, topic in enumerate(concept_topics):
+    for idx, topic in enumerate(teaching_topics):
         concept_res = _safe_call(
             f"concept[{topic}]",
             lambda topic=topic: generate_concept_card(
@@ -2040,22 +1591,16 @@ def teach_node(state: MessagesState):
                 section_lines.append("**Citations:** " + " | ".join(cite_lines))
             sections.append("\n".join(section_lines))
 
-    quiz_topic = focus_topic or (teaching_topics[0] if teaching_topics else fallback_topic)
+    quiz_topic = teaching_topics[0]
     quiz_res = _safe_call(
         "quiz",
         lambda: generate_quiz_card(
             term=quiz_topic,
             language="en",
             teach_db_dir=None,
-            context_override=plan_summary,
             llm=teaching_llm,
         ),
     )
-    try:
-        print(f"[teach-quiz] topic={quiz_topic} result={json.dumps(quiz_res, ensure_ascii=False)[:400] if isinstance(quiz_res, dict) else quiz_res}")
-    except Exception as exc:
-        print(f"[teach-quiz] failed to log quiz data: {exc}")
-    quiz_payload: Optional[Dict[str, Any]] = None
     if isinstance(quiz_res, dict) and quiz_res.get("card"):
         card = quiz_res["card"]
         questions = card.get("questions") or []
@@ -2080,31 +1625,29 @@ def teach_node(state: MessagesState):
             if explanation:
                 quiz_lines.append(f"   Why: {explanation}")
         sections.append("\n".join(quiz_lines))
-        quiz_payload = {
+        
+        # Also return the quiz data as JSON for frontend
+        quiz_json = {
             "card": {
-                "term": card.get("term") or quiz_topic,
+                "term": card.get('term') or quiz_topic,
                 "questions": questions[:3],
                 "citations": card.get("citations") or [],
-                "lang": card.get("lang") or "en",
-                "source": "teach_node",
+                "lang": "en"
             }
         }
+        sections.append(f"\n\n```json\n{json.dumps(quiz_json, ensure_ascii=False)}\n```")
 
     if sections:
         teaching_text = "📚 InvestMate Learning Pack\n\n" + "\n\n".join(sections)
         if tool_errors:
             teaching_text += "\n\n⚠️ Tool notes:\n" + "\n".join(f"- {msg}" for msg in tool_errors)
-        out_messages.append(AIMessage(content=teaching_text))
-        if quiz_payload:
-            out_messages.append(HumanMessage(content=f"QUIZ_JSON: {json.dumps(quiz_payload, ensure_ascii=False)}"))
-        return {"messages": out_messages}
+        return {"messages": [AIMessage(content=teaching_text)]}
 
     fallback_text = (
         "InvestMate could not assemble an education pack from the latest exchange. "
         "Please provide more details about what you would like to learn."
     )
-    out_messages.append(AIMessage(content=fallback_text))
-    return {"messages": out_messages}
+    return {"messages": [AIMessage(content=fallback_text)]}
 
 def intent_gateway_node(state: MessagesState):
     print(f"[call] {inspect.currentframe().f_code.co_name}")
@@ -2234,221 +1777,64 @@ def plan_node(state: MessagesState):
     return {"messages": [AIMessage(content=ai.content)]}
 
 
-def _build_stock_snapshot(tickers: List[str]) -> Dict[str, Any]:
-    selected = [t for t in tickers if _is_valid_ticker(t)]
-    selected = selected[:3]
-    prices_result = get_prices(selected)
-    prices = prices_result.get("prices", {}) if isinstance(prices_result, dict) else {}
-    if prices_result.get("warning"):
-        print(f"[stock-info] price warning: {prices_result.get('warning')}")
-    news_payload: Dict[str, List[Dict[str, Any]]] = {}
-    for ticker in selected:
-        try:
-            articles = news_fetcher.fetch(ticker, limit=2)
-        except Exception as exc:
-            articles = [{"title": "News unavailable", "description": str(exc), "source": "local"}]
-        news_payload[ticker] = articles or []
-    return {
-        "tickers": selected,
-        "prices": prices,
-        "news": news_payload,
-        "price_note": prices_result.get("note"),
-    }
-
-
-def _render_stock_snapshot(snapshot: Dict[str, Any]) -> str:
-    tickers = snapshot.get("tickers") or []
-    if not tickers:
-        return "I could not detect any valid tickers to look up. Please specify the stock symbol (e.g., AAPL)."
-
-    lines = ["📊 Latest market snapshot:"]
-    prices = snapshot.get("prices") or {}
-    for ticker in tickers:
-        pdata = prices.get(ticker) or {}
-        price = pdata.get("price")
-        currency = pdata.get("currency", "USD")
-        ts = pdata.get("timestamp")
-        if isinstance(price, (int, float)):
-            price_f = float(price)
-            if math.isnan(price_f):
-                lines.append(f"- {ticker}: price unavailable right now.")
-                continue
-            ts_str = ""
-            if isinstance(ts, (int, float)) and ts:
-                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                ts_str = dt.strftime("%Y-%m-%d %H:%M UTC")
-            price_part = f"${price_f:,.2f}" if currency == "USD" else f"{price_f:,.2f} {currency}"
-            stamp = f" (as of {ts_str})" if ts_str else ""
-            lines.append(f"- {ticker}: {price_part}{stamp}")
-        else:
-            lines.append(f"- {ticker}: price unavailable right now.")
-
-        articles = snapshot.get("news", {}).get(ticker) or []
-        if articles:
-            lines.append("  Top headlines:")
-            for idx, art in enumerate(articles[:2], 1):
-                title = (art.get("title") or "").strip()
-                source = (art.get("source") or "").strip()
-                published = art.get("published") or art.get("published_display")
-                headline = title if title else "(headline unavailable)"
-                meta = []
-                if source:
-                    meta.append(source)
-                if published:
-                    meta.append(str(published))
-                meta_str = f" ({', '.join(meta)})" if meta else ""
-                lines.append(f"    {idx}. {headline}{meta_str}")
-        else:
-            lines.append("  No recent headlines found.")
-
-    if snapshot.get("price_note"):
-        lines.append(f"_Note: {snapshot['price_note']}_")
-    return "\n".join(lines)
-
-
-def _llm_refine_tickers(user_text: str, candidates: List[str]) -> List[str]:
-    """Use the LLM to validate candidate tickers and optionally map company names to real symbols."""
-    filtered = [t for t in candidates if _is_valid_ticker(t)]
-    llm = build_llm()
-    if not llm or not (filtered or user_text):
-        return filtered
-
-    payload = {
-        "message": user_text,
-        "candidates": filtered,
-    }
-    sys = SystemMessage(content=(
-        "You verify equity tickers mentioned by the user.\n"
-        "Return ONLY one JSON object with this schema:\n"
-        "{\n"
-        '  "tickers": ["TSLA", ...],\n'
-        '  "dropped": ["WORD", ...]\n'
-        "}\n"
-        "- Include only actual exchange tickers (1-5 letters, uppercase).\n"
-        "- If the user mentions a company name, map it to its primary ticker if certain; otherwise drop it.\n"
-        "- Do not guess unknown symbols."
-    ))
-    human = HumanMessage(content=f"TICKER_VALIDATION_JSON: {json.dumps(payload, ensure_ascii=False)}")
-    ai = _llm_invoke_with_log(llm, [sys, human], "ticker-refine")
-    parsed = _extract_json_from_text(ai.content) or {}
-
-    refined: List[str] = []
-    maybe_tickers = parsed.get("tickers")
-    if isinstance(maybe_tickers, list):
-        for t in maybe_tickers:
-            s = str(t).strip().upper()
-            if _is_valid_ticker(s):
-                refined.append(s)
-        return refined
-
-    return filtered
-
-
 def intent_node(state: MessagesState):
     print(f"[call] {inspect.currentframe().f_code.co_name}")
+    llm = build_llm()
     latest_user_msg = next(
         (
             m for m in reversed(state["messages"])
             if isinstance(m, HumanMessage)
-            and not str(m.content).startswith((
-                "USER_PROFILE_JSON",
-                "GATEWAY_JSON",
-                "TOOL_PLAN_JSON",
-                "FACTS_JSON",
-                "HOTLIST_JSON",
-                "INTENT_JSON",
-            ))
+            and not str(m.content).startswith(("USER_PROFILE_JSON", "TOOL_PLAN_JSON", "FACTS_JSON", "HOTLIST_JSON", "INTENT_JSON"))
         ),
         None,
     )
-    user_text = latest_user_msg.content if isinstance(latest_user_msg, HumanMessage) else ""
-    user_text = user_text.strip() if isinstance(user_text, str) else ""
+    latest_human = latest_user_msg or next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
     profile = _get_json(state, "USER_PROFILE_JSON")
-    llm = build_llm()
+    profile_pretty = json.dumps(profile, ensure_ascii=False)
+    user_text = latest_user_msg.content if isinstance(latest_user_msg, HumanMessage) else ""
 
-    detected_tickers = _unique_preserve(_extract_tickers_from_text(user_text))
-    classification: Dict[str, Any] = {}
-    classifier_summary = ""
+    detected_regions: List[str] = []
+    detected_keywords: List[str] = []
+    text_lower = str(user_text).lower() if isinstance(user_text, str) else ""
+    if "red chip" in text_lower:
+        detected_keywords.append("red chip")
+        detected_regions.extend(["China", "Hong Kong"])
+    if any(term in text_lower for term in ["us stock", "u.s. stock", "united states", "america"]):
+        detected_regions.append("US")
+    if not detected_regions:
+        detected_regions.extend((profile or {}).get("preferences", {}).get("regions", []) or [])
+    detected_regions = _unique_preserve([r for r in detected_regions if r])
+    detected_keywords = _unique_preserve(detected_keywords)
 
-    if llm and user_text:
-        sys = SystemMessage(content=(
-            "You classify investment assistant intents.\n"
-            "Return ONLY one JSON object with keys:\n"
-            "{\n"
-            '  "intent": "stock_info | knowledge | recommend",\n'
-            '  "tickers": ["<optional ticker>", ...],\n'
-            '  "reason": "<<=40 words rationale>"\n'
-            "}\n"
-            "- stock_info: user wants prices/news/data for specific tickers.\n"
-            "- knowledge: user wants financial concepts explained (teaching/documentation).\n"
-            "- recommend: user asks for allocations, ideas, screening, or advice.\n"
-            "If no ticker requested, return an empty list."
-        ))
-        human_payload = {
-            "message": user_text,
-            "profile": profile,
-            "detected_tickers": detected_tickers,
-            "history_count": len(state["messages"]),
-        }
-        human = HumanMessage(content=f"INTENT_CLASSIFY_JSON: {json.dumps(human_payload, ensure_ascii=False)}")
-        ai = _llm_invoke_with_log(llm, state["messages"] + [sys, human], "intent-classify")
-        classifier_summary = ai.content.strip()
-        parsed = _extract_json_from_text(classifier_summary)
-        if isinstance(parsed, dict):
-            classification = parsed
-
-    intent_label = str(classification.get("intent") or "").lower()
-    llm_tickers = classification.get("tickers")
-    if isinstance(llm_tickers, list):
-        for t in llm_tickers:
-            if isinstance(t, str):
-                t_upper = t.strip().upper()
-                if _is_valid_ticker(t_upper):
-                    detected_tickers.append(t_upper)
-    detected_tickers = _unique_preserve([t for t in detected_tickers if _is_valid_ticker(t)])
-    refined = _llm_refine_tickers(user_text, detected_tickers)
-    if refined:
-        detected_tickers = refined
-
-    if not intent_label:
-        if _looks_like_teaching(user_text):
-            intent_label = "knowledge"
-        elif detected_tickers and any(
-            kw in user_text.lower() for kw in ["price", "quote", "news", "update", "info", "latest", "earnings"]
-        ):
-            intent_label = "stock_info"
-        else:
-            intent_label = "recommend"
-    elif intent_label in {"teaching", "teach", "knowledge"}:
-        intent_label = "knowledge"
-    elif intent_label in {"stock-info", "price_lookup", "ticker_info"}:
-        intent_label = "stock_info"
-    elif intent_label not in {"stock_info", "knowledge", "recommend"}:
-        intent_label = "recommend"
-
-    intents_payload: Dict[str, Any] = {
-        "timestamp": int(time.time()),
-        "user_text": user_text,
-        "tickers": detected_tickers,
-        "intent": intent_label,
+    sys = SystemMessage(content=(
+        "You are an intent analyst for a wealth advisory agent.\n"
+        "Summarize the user's request, identify the key investment objectives, ESG/sector hints, risk tolerance cues, "
+        "and any tool calls implied (e.g., need prices, news, allocation). "
+        "If information is missing, state assumptions you would adopt. "
+        "Respond in concise English using <=5 bullet points."
+    ))
+    human_payload = {
+        "user_message": user_text,
+        "user_profile": profile,
+        "recent_messages_count": len(state["messages"]),
+        "detected_keywords": detected_keywords,
+        "detected_regions": detected_regions,
     }
-    if classifier_summary:
-        intents_payload["classifier_raw"] = classifier_summary
-    if classification.get("reason"):
-        intents_payload["reason"] = str(classification["reason"])[:160]
+    human = HumanMessage(content=f"INTENT_INPUT_JSON: {json.dumps(human_payload, ensure_ascii=False)}")
+    ai = _llm_invoke_with_log(llm, state["messages"] + [sys, human], "intent")
+    summary_text = ai.content.strip()
+    try:
+        print(f"[intent-summary] {summary_text}")
+    except Exception:
+        pass
 
-    response_messages: List[Any] = []
-    if intent_label == "stock_info":
-        top_tickers = detected_tickers[:3]
-        intents_payload["tickers"] = top_tickers
-        if top_tickers:
-            snapshot = _build_stock_snapshot(top_tickers)
-            intents_payload["snapshot"] = snapshot
-            response_messages.append(AIMessage(content=_render_stock_snapshot(snapshot)))
-        else:
-            response_messages.append(AIMessage(content="Please specify the stock ticker you would like me to look up."))
-    response_messages.append(HumanMessage(content=f"INTENT_JSON: {json.dumps(intents_payload, ensure_ascii=False)}"))
-    return {"messages": response_messages}
+    payload = {
+        "summary": summary_text,
+        "timestamp": int(time.time()),
+        "detected_keywords": detected_keywords,
+        "detected_regions": detected_regions,
+    }
+    return {"messages": [HumanMessage(content=f"INTENT_JSON: {json.dumps(payload, ensure_ascii=False)}")]}
 
 
 def hotlist_node(state: MessagesState):
@@ -2549,10 +1935,7 @@ def select_node(state: MessagesState):
     analysis = _get_json(state, "ANALYSIS_JSON")
     insights = _get_json(state, "INSIGHTS_JSON")
     tickers: List[str] = facts.get("tickers", [])
-    raw_target = facts.get("target_extra_allocation")
-    if not isinstance(raw_target, (int, float)) or raw_target <= 0:
-        raw_target = 0.3
-    target = float(raw_target)
+    target = float(facts.get("target_extra_allocation") or 0.0)
     cap = float(facts.get("max_single_weight", 0.15))
     news = facts.get("news", {})
     prices = (facts.get("prices", {}) or {}).get("prices", {})
@@ -2595,7 +1978,7 @@ def select_node(state: MessagesState):
     human = HumanMessage(content=f"SELECTION_INPUT_JSON: {json.dumps(human_payload, ensure_ascii=False)}")
     # Risk-screen the LLM output afterwards instead of adjusting prompt
     thresholds = {
-        "low": {"beta": 1.20, "ann_vol": 0.32, "mdd_6m": 0.18},
+        "low": {"beta": 1.05, "ann_vol": 0.28, "mdd_6m": 0.12},
         "medium": {"beta": 1.30, "ann_vol": 0.40, "mdd_6m": 0.20},
         "high": {"beta": None, "ann_vol": None, "mdd_6m": None},
     }
@@ -2740,7 +2123,6 @@ def select_node(state: MessagesState):
 
 def gather_node(state: MessagesState):
     print(f"[call] {inspect.currentframe().f_code.co_name}")
-    existing_facts = _get_json(state, "FACTS_JSON") or {}
     # Prefer the most recent AIMessage that actually contains target_extra_allocation,
     # otherwise fall back to the last AIMessage.
     last_ai = next(
@@ -2761,25 +2143,10 @@ def gather_node(state: MessagesState):
     ]
     plan_sectors: List[str] = []
     hot_sectors = [str(s) for s in (hotlist.get("requested_sectors") or []) if isinstance(s, str)]
-    if last_ai and isinstance(last_ai.content, str):
-        raw_plan = last_ai.content.strip()
-        data = _extract_json_from_text(raw_plan)
-        parsed_list: List[str] = []
-        if data is None:
-            try:
-                parsed = json.loads(raw_plan)
-                if isinstance(parsed, list):
-                    parsed_list = [t for t in parsed if isinstance(t, str)]
-                elif isinstance(parsed, dict):
-                    data = parsed
-            except Exception:
-                data = None
-        if parsed_list and not tickers:
-            tickers = parsed_list
+    if last_ai:
+        data = _extract_json_from_text(last_ai.content)
         if isinstance(data, dict):
-            plan_tickers = [t for t in data.get("tickers", []) if isinstance(t, str)]
-            if plan_tickers:
-                tickers = plan_tickers
+            tickers = [t for t in data.get("tickers", []) if isinstance(t, str)]
             sectors = data.get("target_sectors") or []
             if isinstance(sectors, list):
                 plan_sectors = [str(s) for s in sectors if isinstance(s, str) and s]
@@ -2787,11 +2154,8 @@ def gather_node(state: MessagesState):
             try:
                 target_alloc = float(tmp_alloc) if tmp_alloc is not None else None
             except Exception:
-                target_alloc = None
-            try:
-                max_single = float(data.get("max_single_weight", max_single))
-            except Exception:
-                max_single = max_single
+                target_alloc = None                             
+            max_single = float(data.get("max_single_weight", max_single))
     if not tickers and detected_tickers:
         tickers = detected_tickers[:10]
     if not tickers and hot_tickers:
@@ -2810,14 +2174,6 @@ def gather_node(state: MessagesState):
     if not tickers:
         # last resort: still try to get some dynamic universe from index
         tickers = get_index_constituents("^NDX")[:10] or get_index_constituents("^GSPC")[:10] or []
-
-    if not tickers:
-        prev_tickers = existing_facts.get("tickers") if isinstance(existing_facts, dict) else None
-        if isinstance(prev_tickers, list) and prev_tickers:
-            tickers = list(prev_tickers)
-
-    original_universe = list(tickers)
-    target_candidates = max(len(original_universe), _MIN_CANDIDATE_COUNT)
 
     # Read tool plan and optionally override tickers / limits
     tool_plan = _get_json(state, "TOOL_PLAN_JSON")
@@ -2849,93 +2205,25 @@ def gather_node(state: MessagesState):
             pass
 
     risk_result: Dict[str, Any] = {}
-    risk_level_pref = str((profile or {}).get("risk_level", "medium") or "medium").lower()
-
-    def _apply_risk_filter(current: List[str]) -> Dict[str, Any]:
-        nonlocal risk_result
-        if not current:
-            return {"result": {"kept": [], "dropped": {}}, "filtered": [], "dropped": {}}
+    if tickers:
+        risk_level_pref = str((profile or {}).get("risk_level", "medium") or "medium").lower()
         try:
-            _log_tool_call("get_risk_assessment", tickers=",".join(current), risk_level=risk_level_pref)
-            res = get_risk_assessment(current, risk_level=risk_level_pref)
+            _log_tool_call("get_risk_assessment", tickers=",".join(tickers), risk_level=risk_level_pref)
+            risk_result = get_risk_assessment(tickers, risk_level=risk_level_pref)
         except Exception as exc:
             try:
                 print(f"[risk] risk assessment failed: {exc}")
             except Exception:
                 pass
-            res = {"error": str(exc), "tickers": current, "risk_level": risk_level_pref, "kept": current, "dropped": {}}
-        risk_kept = [t for t in (res.get("kept") or []) if isinstance(t, str)]
-        risk_dropped_map = res.get("dropped") if isinstance(res.get("dropped"), dict) else {}
-        filtered = [t for t in risk_kept if t in current]
-        if filtered:
-            try:
-                print(f"[risk-filter] kept={','.join(filtered)} dropped={','.join(risk_dropped_map.keys())}")
-            except Exception:
-                pass
-        else:
-            res.setdefault("note", "all_candidates_breach_risk")
-        return {"result": res, "filtered": filtered, "dropped": risk_dropped_map}
-
-    filtered_tickers = list(tickers)
-    attempt = 0
-    seen: set[str] = set(tickers)
-    profile = _get_json(state, "USER_PROFILE_JSON")
-    prefs = (profile or {}).get("preferences", {})
-    while attempt < 4 and len(filtered_tickers) < target_candidates:
-        attempt += 1
-        risk_info = _apply_risk_filter(filtered_tickers)
-        res = risk_info.get("result") or {}
-        filtered = risk_info.get("filtered") or []
-        dropped_map = risk_info.get("dropped") or {}
-        risk_result = res
-        if filtered:
-            filtered_tickers = filtered
-            if len(filtered_tickers) >= target_candidates:
-                break
-        extra: List[str] = []
-        discover_count = max(target_candidates * (attempt + 1), target_candidates + 2)
-        more = discover_candidates(prefs, max_candidates=discover_count) or []
-        extra.extend(more)
-        if not extra and plan_sectors:
-            extra.extend(_fallback_sector_tickers(plan_sectors, limit=discover_count))
-        if not extra and hot_sectors:
-            extra.extend(_fallback_sector_tickers(hot_sectors, limit=discover_count))
-        if not extra and hot_tickers:
-            extra.extend(hot_tickers)
-        extra = [t for t in extra if isinstance(t, str) and t not in seen]
-        if extra:
-            try:
-                print(f"[risk-refill] attempt={attempt} added={','.join(extra[:10])}{'...' if len(extra)>10 else ''}")
-            except Exception:
-                pass
-            filtered_tickers.extend(extra)
-            seen.update(extra)
-        else:
-            if filtered_tickers:
-                break
-
-    if filtered_tickers:
-        filtered_tickers = filtered_tickers[:target_candidates]
-    else:
-        filtered_tickers = original_universe[:target_candidates]
-        risk_result.setdefault("note", "using_unfiltered_candidates_due_to_risk")
-
-    tickers = _unique_preserve(filtered_tickers)
-    tickers = tickers[:target_candidates]
-    if isinstance(risk_result, dict):
-        risk_result["kept"] = tickers
-        risk_result.setdefault("filtered_universe", tickers)
+            risk_result = {"error": str(exc), "tickers": tickers, "risk_level": risk_level_pref}
 
     # One-line query logs
-    if use_prices and tickers:
+    if use_prices:
         try:
             print(f"[query] get_prices: {','.join(tickers)}")
         except Exception:
             pass
         prices = get_prices(tickers)
-    elif use_prices:
-        existing_prices = existing_facts.get("prices") if isinstance(existing_facts, dict) else None
-        prices = existing_prices if isinstance(existing_prices, dict) else {"prices": {}}
     else:
         print("[skip] get_prices disabled by tool plan")
         prices = {"prices": {}}
@@ -3042,27 +2330,14 @@ def gather_node(state: MessagesState):
             print(f"[skip] get_analyst_reports disabled by tool plan for {t}")
             reports_dict[t] = {"ticker": t, "reports": []}
 
-    if not tickers and isinstance(existing_facts, dict):
-        existing_news = existing_facts.get("news")
-        existing_reports = existing_facts.get("analyst")
-        if isinstance(existing_news, dict):
-            news_dict = existing_news
-        if isinstance(existing_reports, dict):
-            reports_dict = existing_reports
-
     if target_alloc is None:
         # fallback to profile constraint 0.3
         prof = profile or {}
-        target_alloc = (prof.get("constraints", {}) or {}).get("target_extra_allocation")
-    if not isinstance(target_alloc, (int, float)) or target_alloc <= 0:
-        target_alloc = 0.3
+        target_alloc = (prof.get("constraints", {}) or {}).get("target_extra_allocation", 0.3)
     ta = float(target_alloc)
-    suggested_raw = _build_suggested_weights(tickers, ta, max_single)
-    suggested = _normalize_allocation(suggested_raw, tickers, ta, max_single) or suggested_raw
+    suggested = _build_suggested_weights(tickers, ta, max_single)
     facts = {
         "tickers": tickers,
-        "original_universe": original_universe,
-        "candidate_target": target_candidates,
         "target_extra_allocation": target_alloc,
         "max_single_weight": max_single,
         "suggested_weights": suggested,
@@ -3072,173 +2347,6 @@ def gather_node(state: MessagesState):
         "risk": risk_result,
     }
     return {"messages": [HumanMessage(content=f"FACTS_JSON: {json.dumps(facts, ensure_ascii=False)}")]}
-
-
-def candidate_enforcer_node(state: MessagesState):
-    print(f"[call] {inspect.currentframe().f_code.co_name}")
-    facts = _get_json(state, "FACTS_JSON")
-    if not isinstance(facts, dict):
-        return {}
-
-    tickers = list(facts.get("tickers") or [])
-    target_candidates = int(facts.get("candidate_target") or max(len(tickers), _MIN_CANDIDATE_COUNT))
-    target_candidates = max(target_candidates, _MIN_CANDIDATE_COUNT)
-
-    original_universe = facts.get("original_universe") or []
-    prices_payload = facts.get("prices") or {"prices": {}}
-    if not isinstance(prices_payload, dict):
-        prices_payload = {"prices": {}}
-    price_map = prices_payload.get("prices") or {}
-    if not isinstance(price_map, dict):
-        price_map = {}
-
-    news_payload = facts.get("news") or {}
-    if not isinstance(news_payload, dict):
-        news_payload = {}
-
-    analyst_payload = facts.get("analyst") or {}
-    if not isinstance(analyst_payload, dict):
-        analyst_payload = {}
-
-    risk_result = facts.get("risk") or {}
-    if not isinstance(risk_result, dict):
-        risk_result = {}
-
-    profile = _get_json(state, "USER_PROFILE_JSON")
-    prefs = (profile or {}).get("preferences", {})
-    risk_level_pref = str((profile or {}).get("risk_level", "medium") or "medium").lower()
-
-    if len(tickers) >= target_candidates:
-        return {}
-
-    seen: set[str] = set(tickers)
-    plan_sectors = []
-    last_plan_ai = next(
-        (m for m in reversed(state["messages"]) if isinstance(m, AIMessage) and "target_sectors" in str(m.content)),
-        None,
-    )
-    if last_plan_ai:
-        plan_data = _extract_json_from_text(last_plan_ai.content)
-        if isinstance(plan_data, dict):
-            sectors = plan_data.get("target_sectors") or []
-            if isinstance(sectors, list):
-                plan_sectors = [str(s) for s in sectors if isinstance(s, str) and s]
-
-    hotlist = _get_json(state, "HOTLIST_JSON")
-    hot_sectors = [str(s) for s in (hotlist.get("requested_sectors") or []) if isinstance(s, str)] if isinstance(hotlist, dict) else []
-    hot_tickers = [str(t) for t in (hotlist.get("all_tickers") or []) if isinstance(t, str)] if isinstance(hotlist, dict) else []
-
-    def _extend_data(new_syms: List[str]) -> None:
-        nonlocal price_map, news_payload, analyst_payload
-        to_fetch = [t for t in new_syms if t not in price_map]
-        if to_fetch:
-            try:
-                price_res = get_prices(to_fetch)
-                for sym, data in (price_res.get("prices") or {}).items():
-                    price_map[sym] = data
-            except Exception as exc:
-                print(f"[candidate-enforcer] price fetch failed: {exc}")
-
-        for sym in new_syms:
-            if sym not in news_payload:
-                try:
-                    articles_raw = news_fetcher.fetch(sym, limit=2)
-                except Exception:
-                    articles_raw = []
-                enriched: List[Dict[str, Any]] = []
-                previews: List[str] = []
-                for art in articles_raw or []:
-                    d = dict(art) if isinstance(art, dict) else {"title": str(art)}
-                    preview_src = d.get("description") or d.get("content") or d.get("title") or ""
-                    preview = _news_preview(preview_src)
-                    ts = _format_news_timestamp(d.get("published"))
-                    if ts:
-                        d["published_display"] = ts
-                        preview = f"[{ts}] {preview}" if preview else f"[{ts}]"
-                    d["preview"] = preview
-                    enriched.append(d)
-                    if preview:
-                        previews.append(preview)
-                summary = " ".join(previews[:3]) if previews else ""
-                news_payload[sym] = {"query": sym, "articles": enriched}
-                if summary:
-                    news_payload[sym]["summary"] = summary
-
-            if sym not in analyst_payload:
-                try:
-                    analyst_payload[sym] = get_analyst_reports(sym, limit=1)
-                except Exception as exc:
-                    analyst_payload[sym] = {"ticker": sym, "error": str(exc)}
-
-    attempt = 0
-    max_attempts = 4
-    final_tickers = list(tickers)
-
-    while len(final_tickers) < target_candidates and attempt < max_attempts:
-        attempt += 1
-        discover_count = max(target_candidates * (attempt + 1), target_candidates + len(final_tickers) + 2)
-        extras = discover_candidates(prefs, max_candidates=discover_count) or []
-        if not extras and plan_sectors:
-            extras = _fallback_sector_tickers(plan_sectors, limit=discover_count)
-        if not extras and hot_sectors:
-            extras = _fallback_sector_tickers(hot_sectors, limit=discover_count)
-        if not extras and hot_tickers:
-            extras = hot_tickers[:discover_count]
-        extras = [t for t in extras if isinstance(t, str) and t not in seen]
-        if extras:
-            seen.update(extras)
-            final_tickers.extend(extras)
-        try:
-            risk_info = get_risk_assessment(final_tickers, risk_level=risk_level_pref)
-        except Exception as exc:
-            print(f"[candidate-enforcer] risk assess failed: {exc}")
-            risk_info = risk_result or {"kept": final_tickers, "dropped": {}, "error": str(exc)}
-
-        kept = [t for t in (risk_info.get("kept") or []) if isinstance(t, str)]
-        if kept:
-            final_tickers = _unique_preserve(kept)
-        else:
-            risk_info.setdefault("note", "all_candidates_breach_risk")
-            if not extras:
-                break
-
-        if len(final_tickers) >= target_candidates:
-            risk_result = risk_info
-            break
-
-    final_tickers = _unique_preserve(final_tickers)
-    if len(final_tickers) > target_candidates:
-        final_tickers = final_tickers[:target_candidates]
-
-    if final_tickers == tickers:
-        return {}
-
-    _extend_data([sym for sym in final_tickers if sym not in (facts.get("tickers") or [])])
-
-    risk_result.setdefault("filtered_universe", final_tickers)
-    risk_result["kept"] = final_tickers
-
-    filtered_price_map = {t: price_map.get(t) for t in final_tickers if t in price_map}
-    prices_payload["prices"] = filtered_price_map
-    filtered_news = {t: news_payload.get(t) for t in final_tickers if t in news_payload}
-    filtered_analyst = {t: analyst_payload.get(t) for t in final_tickers if t in analyst_payload}
-
-    updated_facts = dict(facts)
-    updated_facts["tickers"] = final_tickers
-    updated_facts["risk"] = risk_result
-    updated_facts.setdefault("candidate_target", target_candidates)
-    updated_facts.setdefault("original_universe", original_universe or final_tickers)
-    updated_facts["prices"] = prices_payload
-    updated_facts["news"] = filtered_news
-    updated_facts["analyst"] = filtered_analyst
-
-    target_alloc = updated_facts.get("target_extra_allocation")
-    if not isinstance(target_alloc, (int, float)) or target_alloc <= 0:
-        target_alloc = 0.3
-    max_single = float(updated_facts.get("max_single_weight", 0.15))
-    updated_facts["suggested_weights"] = _build_suggested_weights(final_tickers, float(target_alloc), max_single)
-
-    return {"messages": [HumanMessage(content=f"FACTS_JSON: {json.dumps(updated_facts, ensure_ascii=False)}")]} 
 
 
 def synthesize_node(state: MessagesState):
@@ -3263,10 +2371,7 @@ def synthesize_node(state: MessagesState):
         return {"messages": [AIMessage(content="Unable to render summary: PICKS_JSON allocation missing.")]}
 
     tickers: List[str] = list(allocation_ssot.keys())
-    raw_target = facts.get("target_extra_allocation")
-    if not isinstance(raw_target, (int, float)) or raw_target <= 0:
-        raw_target = 0.3
-    target = float(raw_target)
+    target = float(facts.get("target_extra_allocation") or 0.0)
     cap = float(facts.get("max_single_weight", 0.15))
     news = facts.get("news", {})
     analyst = facts.get("analyst", {})
@@ -3302,7 +2407,7 @@ def synthesize_node(state: MessagesState):
     risk_compromise = False
     risk_compromise_notes: Dict[str, str] = {}
     if risk_level == "low":
-        thresholds = {"beta": 1.20, "ann_vol": 0.32, "mdd_6m": 0.18}
+        thresholds = {"beta": 1.05, "ann_vol": 0.28, "mdd_6m": 0.12}
         for t in tickers:
             metrics = risk_metrics.get(t) or {}
             beta = metrics.get("beta")
@@ -3326,22 +2431,20 @@ def synthesize_node(state: MessagesState):
     # Ask LLM *only* for rationale & risk text (no weights)
     rationale_sys = SystemMessage(content=(
         "You are a concise investment writer.\n"
-        "For each ticker, you may ONLY reference these fields: news_titles, news_summary, analyst_snippets, selection_rationale, price.\n"
-        "Do NOT invent price targets, analyst names, or data that are not present.\n"
-        "If a field is missing or empty, explicitly state 'data unavailable, omitted'.\n"
-        "Write AT LEAST THREE bullet rationale points per ticker (each <=25 words) using the allowed fields, and ONE key risk (<=12 words).\n"
-        "Return ONLY a fenced JSON with the schema:\n"
-        "```json\n{\n  \"rationales\": {\"TICKER\": [\"point1\", ...]},\n  \"risks\": {\"TICKER\": \"risk text\"}\n}\n```"
+        "For each ticker you are given, write AT LEAST THREE bullet-point rationales (each <=25 words) using the provided 3-news titles, analyst snippets, and selection notes.\n"
+        "Also provide exactly one key risk (<=12 words).\n"
+        "Return ONLY a fenced JSON with this schema:\n"
+        "```json\n{\n  \"rationales\": {\"AAPL\": [\"reason1\", \"reason2\", \"reason3\"], ...},\n  \"risks\": {\"AAPL\": \"...\", ...}\n}\n```\n"
+        "Ensure each ticker has at least three distinct rationale entries."
     ))
     mini_facts = {
         "tickers": tickers,
         "snippets": {
             t: {
-                "news_titles": " | ".join([a.get("title") or "" for a in (news.get(t, {}) or {}).get("articles", [])][:3]) or "data unavailable, omitted",
-                "news_summary": (news.get(t, {}) or {}).get("summary") or "data unavailable, omitted",
-                "analyst_snippets": " | ".join([r.get("snippet") or "" for r in (analyst.get(t, {}) or {}).get("reports", [])][:3]) or "data unavailable, omitted",
-                "selection_rationale": selection_rationale.get(t, "data unavailable, omitted"),
-                "price": (prices.get(t) or {}).get("price") if isinstance(prices.get(t), dict) else "data unavailable, omitted",
+                "news_titles": " | ".join([a.get("title") or "" for a in (news.get(t, {}) or {}).get("articles", [])][:3]),
+                "news_summary": (news.get(t, {}) or {}).get("summary", ""),
+                "analyst_snippets": " | ".join([r.get("snippet") or "" for r in (analyst.get(t, {}) or {}).get("reports", [])][:3]),
+                "selection_rationale": selection_rationale.get(t, ""),
                 "risk_metrics": risk_metrics.get(t) or {},
                 "risk_screen": selection_risk_excluded.get(t) if isinstance(selection_risk_excluded.get(t), dict) else risk_dropped.get(t),
             } for t in tickers
@@ -3535,45 +2638,10 @@ def jargon_node(state: MessagesState):
     }
     return {"messages": [HumanMessage(content=f"JARGON_JSON: {json.dumps(payload, ensure_ascii=False)}")]}
 
-
-def stock_info_exit_node(state: MessagesState):
-    print(f"[call] {inspect.currentframe().f_code.co_name}")
-    return {}
-
-
-# Inject helper dependencies into the general plan module once the utilities above are defined.
-configure_general_plan(
-    _get_json=_get_json,
-    _log_tool_call=_log_tool_call,
-    build_llm=build_llm,
-    _llm_invoke_with_log=_llm_invoke_with_log,
-    get_prices=get_prices,
-    news_fetcher=news_fetcher,
-    get_analyst_reports=get_analyst_reports,
-    get_risk_assessment=get_risk_assessment,
-    discover_candidates=discover_candidates,
-    _unique_preserve=_unique_preserve,
-    _is_valid_ticker=_is_valid_ticker,
-    _news_preview=_news_preview,
-    _format_news_timestamp=_format_news_timestamp,
-    _MIN_CANDIDATE_COUNT=_MIN_CANDIDATE_COUNT,
-)
-
-
 def _start_router(state: MessagesState) -> str:
     latest = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
     txt = latest.content if (latest and isinstance(latest.content, str)) else ""
     return "teach" if _looks_like_teaching(txt) else "profile"
-
-
-def _intent_router(state: MessagesState) -> str:
-    payload = _get_json(state, "INTENT_JSON")
-    intent = (payload.get("intent") or "").lower()
-    if intent == "stock_info":
-        return "stock_info_done"
-    if intent == "knowledge":
-        return "teach"
-    return "plan"
 
 # =============================================
 # GRAPH (build)
@@ -3587,20 +2655,16 @@ def build_agent():
     g.add_node("gateway", intent_gateway_node)
     g.add_node("general_chat", general_chat_node)
     g.add_node("intent", intent_node)
-    g.add_node("stock_info_done", stock_info_exit_node)
     g.add_node("plan", plan_node)
     g.add_node("hotlist", hotlist_node)
     g.add_node("toolplan", tool_plan_node)
     g.add_node("gather", gather_node)
-    g.add_node("candidate_enforcer", candidate_enforcer_node)
     g.add_node("insights", insights_node)
     g.add_node("analyze", analyze_node)
     g.add_node("select", select_node)
     g.add_node("allocate", allocate_node)
     g.add_node("synthesize", synthesize_node)
-    g.add_node("summary", summary_node)
     g.add_node("jargon", jargon_node)
-    g.add_node("general_plan", general_plan_node)
 
     # Route START to either the teaching or primary investment branch
     g.add_conditional_edges(
@@ -3623,53 +2687,17 @@ def build_agent():
         },
     )
     g.add_edge("general_chat", END)
-    g.add_conditional_edges(
-        "intent",
-        _intent_router,
-        {
-            "stock_info_done": "stock_info_done",
-            "teach": "teach",
-            "plan": "plan",
-        },
-    )
-    g.add_edge("stock_info_done", END)
-    g.add_edge("plan", "general_plan")
-    g.add_edge("hotlist", "general_plan")
-    g.add_edge("toolplan", "general_plan")
-    g.add_edge("gather", "candidate_enforcer")
-    g.add_edge("candidate_enforcer", "general_plan")
-    g.add_edge("insights", "general_plan")
-    g.add_edge("analyze", "general_plan")
-    g.add_edge("select", "general_plan")
-    g.add_edge("allocate", "general_plan")
-    g.add_edge("synthesize", "summary")
-    g.add_edge("summary", "jargon")
+    g.add_edge("intent", "plan")
+    g.add_edge("plan", "hotlist")
+    g.add_edge("hotlist", "toolplan")
+    g.add_edge("toolplan", "gather")
+    g.add_edge("gather", "insights")
+    g.add_edge("insights", "analyze")
+    g.add_edge("analyze", "select")
+    g.add_edge("select", "allocate")
+    g.add_edge("allocate", "synthesize")
+    g.add_edge("synthesize", "jargon")
     g.add_edge("jargon", "teach")
-    g.add_conditional_edges(
-        "general_plan",
-        route_from_general_plan,
-        {
-            "plan": "plan",
-            "hotlist": "hotlist",
-            "toolplan": "toolplan",
-            "gather": "gather",
-            "candidate_enforcer": "candidate_enforcer",
-            "insights": "insights",
-            "analyze": "analyze",
-            "select": "select",
-            "allocate": "allocate",
-            "summary": "summary",
-            "synthesize": "synthesize",
-            "jargon": "jargon",
-            "teach": "teach",
-            "general_chat": "general_chat",
-            "profile": "profile",
-            "gateway": "gateway",
-            "intent": "intent",
-            "stock_info_done": "stock_info_done",
-            "END": END,
-        },
-    )
     g.add_edge("teach", END)
 
     return g.compile()
@@ -3689,13 +2717,29 @@ def get_agent():
 
 
 def _prepare_messages(user_query: str, history: Optional[List[Dict[str, str]]] = None) -> List[Any]:
-    """
-    Build the message list for a fresh turn.
-
-    History is intentionally ignored so each invocation starts a clean graph run,
-    preventing the previous dialogue from leaking into the next conversation.
-    """
-    return [HumanMessage(content=user_query)]
+    """Convert optional chat history into LangChain message objects and append the new user input."""
+    prepared: List[Any] = []
+    for item in history or []:
+        if isinstance(item, (HumanMessage, AIMessage, SystemMessage)):
+            prepared.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if content is None:
+            continue
+        content_str = str(content)
+        if not content_str.strip():
+            continue
+        role = str(item.get("role", "")).lower()
+        if role in {"user", "human"}:
+            prepared.append(HumanMessage(content=content_str))
+        elif role in {"assistant", "ai", "model"}:
+            prepared.append(AIMessage(content=content_str))
+        elif role == "system":
+            prepared.append(SystemMessage(content=content_str))
+    prepared.append(HumanMessage(content=user_query))
+    return prepared
 
 
 def run_agent_sync(user_query: str, history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
@@ -3724,7 +2768,7 @@ def run_agent_sync(user_query: str, history: Optional[List[Dict[str, str]]] = No
         }
 
     user_id = _DEFAULT_PERSONA.get("user_id", "demo_user")
-    sanitized_history: List[Dict[str, str]] = []
+    sanitized_history = _sanitize_history_for_agent(history, _PII_PROTECTION_LEVEL)
     protection = protect_user_message(user_query, user_id, _PII_PROTECTION_LEVEL)
     session_id = protection.get("session_id")
     anonymized_query = protection.get("anonymized_text", user_query)
@@ -3735,31 +2779,13 @@ def run_agent_sync(user_query: str, history: Optional[List[Dict[str, str]]] = No
     plan_text: Optional[str] = None
     teach_text: Optional[str] = None
     general_text: Optional[str] = None
-    stock_text: Optional[str] = None
-    last_facts_payload: Optional[Dict[str, Any]] = None
-
-    def _capture_state_payload(raw_content: Any) -> None:
-        nonlocal last_facts_payload
-        if not isinstance(raw_content, str):
-            return
-        prefix, _, rest = raw_content.partition(":")
-        if prefix.strip() != "FACTS_JSON" or not rest:
-            return
-        try:
-            last_facts_payload = json.loads(rest.strip())
-        except Exception:
-            pass
-
     try:
         for update in agent.stream({"messages": messages}, stream_mode="updates"):
             for node, ev in update.items():
-                if not isinstance(ev, dict):
-                    continue
                 payload = ev.get("messages") or []
                 for msg in payload:
                     content_raw = getattr(msg, "content", "")
-                    _capture_state_payload(content_raw)
-                    if session_id and isinstance(msg, AIMessage) and node not in {"synthesize", "teach", "jargon"}:
+                    if session_id and isinstance(msg, AIMessage):
                         content = restore_llm_response(content_raw, session_id)
                     else:
                         content = content_raw
@@ -3771,13 +2797,8 @@ def run_agent_sync(user_query: str, history: Optional[List[Dict[str, str]]] = No
                         teach_text = content
                     elif node == "general_chat" and isinstance(msg, AIMessage):
                         general_text = content
-                    elif node == "intent" and isinstance(msg, AIMessage):
-                        stock_text = content
-        if plan_text is None and teach_text is None and general_text is None and stock_text is None:
+        if plan_text is None and teach_text is None and general_text is None:
             state = agent.invoke({"messages": messages})
-            for msg in state.get("messages", []):
-                raw = getattr(msg, "content", "")
-                _capture_state_payload(raw)
             gateway_state = _get_json(state, "GATEWAY_JSON")
             is_finance_branch = not (isinstance(gateway_state, dict) and not gateway_state.get("is_finance", True))
             plan_candidate: Optional[str] = None
@@ -3785,7 +2806,7 @@ def run_agent_sync(user_query: str, history: Optional[List[Dict[str, str]]] = No
             general_candidate: Optional[str] = None
             for msg in reversed(state.get("messages", [])):
                 if isinstance(msg, AIMessage):
-                    restored_content = restore_llm_response(msg.content, session_id) if (session_id and msg.type not in {"ai"} and node not in {"synthesize", "teach", "jargon"}) else msg.content
+                    restored_content = restore_llm_response(msg.content, session_id) if session_id else msg.content
                     if not is_finance_branch and general_candidate is None:
                         general_candidate = restored_content
                         events.append({
@@ -3826,41 +2847,9 @@ def run_agent_sync(user_query: str, history: Optional[List[Dict[str, str]]] = No
                         ev["node"] = "synthesize"
                         break
     except Exception as exc:
-        error_text = str(exc)
-        if "Recursion limit" in error_text:
-            if last_facts_payload is None:
-                for ev in reversed(events):
-                    content = ev.get("content")
-                    if isinstance(content, str) and content.startswith("FACTS_JSON:"):
-                        _, _, rest = content.partition(":")
-                        try:
-                            last_facts_payload = json.loads(rest.strip())
-                            break
-                        except Exception:
-                            continue
-            fallback_info = _fallback_from_facts(last_facts_payload or {})
-            if fallback_info:
-                fallback_message = fallback_info.get("message", "")
-                events.append({
-                    "node": "fallback",
-                    "role": "system",
-                    "content": fallback_message,
-                    "note": "recursion_limit",
-                })
-                return {
-                    "final": fallback_message,
-                    "events": events,
-                    "warning": {
-                        "type": "recursion_limit",
-                        "message": error_text,
-                        "fallback_ticker": fallback_info.get("ticker"),
-                    },
-                }
         return {"final": None, "events": events, "error": str(exc)}
     final_text: Optional[str]
-    if stock_text and not (plan_text or teach_text or general_text):
-        final_text = stock_text
-    elif plan_text and teach_text:
+    if plan_text and teach_text:
         final_text = f"{plan_text}\n\n{teach_text}"
     elif plan_text or teach_text:
         final_text = plan_text or teach_text
@@ -3884,50 +2873,22 @@ def run_agent_stream(user_query: str, history: Optional[List[Dict[str, str]]] = 
         return
 
     user_id = _DEFAULT_PERSONA.get("user_id", "demo_user")
-    sanitized_history: List[Dict[str, str]] = []
+    sanitized_history = _sanitize_history_for_agent(history, _PII_PROTECTION_LEVEL)
     protection = protect_user_message(user_query, user_id, _PII_PROTECTION_LEVEL)
     session_id = protection.get("session_id")
     anonymized_query = protection.get("anonymized_text", user_query)
 
     agent = get_agent()
     messages = _prepare_messages(anonymized_query, sanitized_history)
-    last_facts_payload: Optional[Dict[str, Any]] = None
-
-    def _capture_state_payload(raw_content: Any) -> None:
-        nonlocal last_facts_payload
-        if not isinstance(raw_content, str):
-            return
-        prefix, _, rest = raw_content.partition(":")
-        if prefix.strip() != "FACTS_JSON" or not rest:
-            return
-        try:
-            last_facts_payload = json.loads(rest.strip())
-        except Exception:
-            pass
-
-    try:
-        for update in agent.stream({"messages": messages}, stream_mode="updates"):
-            for node, ev in update.items():
-                if not isinstance(ev, dict):
-                    continue
-                payload = ev.get("messages") or []
-                for msg in payload:
-                    _capture_state_payload(getattr(msg, "content", ""))
-                if node not in {"synthesize", "teach", "general_chat"}:
-                    continue
-                for msg in payload:
-                    if isinstance(msg, AIMessage):
-                        text = msg.content
-                        restored = restore_llm_response(text, session_id) if session_id else text
-                        yield restored
-    except Exception as exc:
-        error_text = str(exc)
-        if "Recursion limit" in error_text:
-            fallback_info = _fallback_from_facts(last_facts_payload or {})
-            if fallback_info:
-                yield fallback_info.get("message", "")
-                return
-        raise
+    for update in agent.stream({"messages": messages}, stream_mode="updates"):
+        for node, ev in update.items():
+            if node not in {"synthesize", "teach", "general_chat"}:
+                continue
+            for msg in ev.get("messages") or []:
+                if isinstance(msg, AIMessage):
+                    text = msg.content
+                    restored = restore_llm_response(text, session_id) if session_id else text
+                    yield restored
 
 # =============================================
 # DEMO (main)
@@ -4009,8 +2970,5 @@ if __name__ == "__main__":
             _builtins.print("\n\n".join(final_outputs))
     else:
         print("---- Done ----")
-DELISTED_TICKERS = {
-    "APC",  # acquired by OXY
-    "TOT",  # renamed to TTE
-    "TTP", "TWX", "GEH", "GEK",  # historical examples
-}
+
+    

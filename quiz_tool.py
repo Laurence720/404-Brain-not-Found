@@ -1,27 +1,25 @@
-
 """
 quiz_tool.py — Quiz Card generator
-测验卡：2–3 道单选/判断 + 简短解析（便于记忆巩固）
 
-功能
-----
-- 围绕某个术语/主题（term）自动生成 2–3 道测验题（单选/判断），并附简短解析。
-- 可选 RAG：若提供 teach_db/（FAISS + sentence-transformers），将检索上下文，帮助更贴近事实。
-- 可选 LLM（如 IBM watsonx）；无 LLM 时返回可复现的“通用测验”骨架卡。
-- 同时提供 Python API 与 LangChain StructuredTool，方便大模型“调用工具”。
-
-返回结构
+Features
 --------
+- Create 2–3 quiz questions (single-choice or true/false) around a finance term, each with a concise explanation.
+- Optional RAG: when teach_db/ (FAISS + sentence-transformers) is available, the tool retrieves supporting context.
+- Optional LLM (e.g., IBM watsonx); without an LLM it returns a deterministic “skeleton” quiz.
+- Provides both a Python API and a LangChain StructuredTool for agent integration.
+
+Return schema
+-------------
 {
   "card": {
-    "term": "…",
+    "term": "...",
     "questions": [
       {
         "type": "single" | "bool",
-        "question": "…",
-        "options": ["A","B","C","D"],     # 对于 type=single
-        "answer": 0 | true | false,       # 单选为正确选项索引；判断为布尔
-        "explanation": "简短解析（≤40字/≤30 words）"
+        "question": "...",
+        "options": ["A","B","C","D"],     # for single-choice questions
+        "answer": 0 | true | false,       # index for single-choice, boolean for true/false
+        "explanation": "Short rationale (≤40 chars / ≤30 words)"
       }
     ],
     "citations": [{"title":"", "url":"", "source":""}],
@@ -33,9 +31,10 @@ quiz_tool.py — Quiz Card generator
 
 from __future__ import annotations
 import os, json, random
+import time
 from typing import Any, Dict, List, Optional
 
-# ---------- 可选依赖（优雅降级） ----------
+# ---------- Optional dependencies (graceful degradation) ----------
 try:
     from langchain_ibm import ChatWatsonx  # type: ignore
     _WATSONX_AVAILABLE = True
@@ -48,26 +47,19 @@ try:
     from langchain_core.tools import StructuredTool
     _LC_CORE_AVAILABLE = True
 except Exception:
-    SystemMessage = None  # type: ignore
-    HumanMessage = None   # type: ignore
-    StructuredTool = None # type: ignore
+    SystemMessage = HumanMessage = StructuredTool = None  # type: ignore
     _LC_CORE_AVAILABLE = False
 
 try:
+    from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore
     from langchain_community.vectorstores import FAISS  # type: ignore
-    from langchain_huggingface import HuggingFaceEmbeddings as _HFEmb  # type: ignore
+    _RAG_AVAILABLE = True
 except Exception:
-    try:
-        from langchain_community.embeddings import HuggingFaceEmbeddings as _HFEmb  # type: ignore
-        from langchain_community.vectorstores import FAISS  # type: ignore
-    except Exception:
-        _HFEmb = None  # type: ignore
-        FAISS = None   # type: ignore
-
-HuggingFaceEmbeddings = _HFEmb
+    HuggingFaceEmbeddings = FAISS = None  # type: ignore
+    _RAG_AVAILABLE = False
 
 
-# ---------- LLM 构造（可选 watsonx） ----------
+# ---------- LLM builder (optional watsonx) ----------
 def _get_project_id() -> Optional[str]:
     for key in ("PROJ_ID", "PROJECT_ID", "WATSONX_PROJECT_ID"):
         v = os.getenv(key)
@@ -82,120 +74,368 @@ def build_default_llm():
     project_id = _get_project_id()
     if not project_id:
         return None
-    return ChatWatsonx(
-        model_id=model_id,
-        project_id=project_id,
-        params={"decoding_method": "greedy", "max_new_tokens": 400, "temperature": 0.0},
-    )
+    try:
+        llm = ChatWatsonx(
+            model_id=model_id,
+            project_id=project_id,
+            params={"decoding_method": "greedy", "max_new_tokens": 400, "temperature": 0.0},
+        )
+        return llm
+    except Exception:
+        return None
 
 
-# ---------- teach_db 检索（可选 RAG） ----------
+# ---------- teach_db retrieval (optional RAG) ----------
 def _load_teach_vs(teach_db_dir: Optional[str] = None):
     base = teach_db_dir or os.path.join(os.path.dirname(__file__), "teach_db")
-    if (FAISS is None) or (HuggingFaceEmbeddings is None):
+    
+    if not _RAG_AVAILABLE:
         return None, False
-    if not os.path.isdir(base):
-        return None, False
+    
     try:
-        embed = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        vs = FAISS.load_local(base, embeddings=embed, allow_dangerous_deserialization=True)
-        retriever = vs.as_retriever(search_kwargs={"k": 8})
-        return retriever, True
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        vs = FAISS.load_local(base, embeddings, allow_dangerous_deserialization=True)
+        return vs.as_retriever(search_kwargs={"k": 3}), True
     except Exception:
         return None, False
 
+
 def _format_docs_for_prompt(docs: List[Any], max_chars: int = 2800) -> str:
-    chunks, used = [], 0
-    for i, d in enumerate(docs or [], 1):
-        text = str(getattr(d, "page_content", "") or "").strip()
-        if not text:
-            continue
-        meta = getattr(d, "metadata", {}) or {}
-        src = meta.get("source") or meta.get("url") or meta.get("title") or ""
-        head = f"[{i}] {src}".strip() if src else f"[{i}]"
-        snippet = (text[:800] + "...") if len(text) > 800 else text
-        block = f"{head}\n{snippet}"
-        if used + len(block) > max_chars:
-            break
-        chunks.append(block); used += len(block)
-    return "\n\n".join(chunks)
+    if not docs:
+        return ""
+    chunks = []
+    for doc in docs:
+        text = getattr(doc, "page_content", str(doc))
+        if text:
+            chunks.append(text)
+    combined = "\n\n".join(chunks)
+    return combined[:max_chars] + ("..." if len(combined) > max_chars else "")
+
 
 def _collect_citations(docs: List[Any], limit: int = 5) -> List[Dict[str, str]]:
-    cites = []
-    for d in (docs or [])[:limit]:
-        meta = getattr(d, "metadata", {}) or {}
-        title = str(meta.get("title") or meta.get("source") or "")[:160]
-        url = str(meta.get("url") or "")
-        source = str(meta.get("source") or meta.get("site") or "")
-        cites.append({"title": title, "url": url, "source": source})
-    return cites
+    citations = []
+    for doc in docs[:limit]:
+        metadata = getattr(doc, "metadata", {})
+        citations.append({
+            "title": metadata.get("title", ""),
+            "url": metadata.get("url", ""),
+            "source": metadata.get("source", "")
+        })
+    return citations
+
+
+# ---------- Educational helpers ----------
+def _ensure_educational_explanation(explanation: Optional[str], term: str, lang: str) -> str:
+    term_clean = str(term or "").strip()
+    lang = (lang or "zh").lower()
+    text = (str(explanation or "").strip())
+
+    if lang.startswith("zh"):
+        default_text = f"{term_clean} clarifies its role in investment decisions and risk awareness."
+        if not text or len(text) < 10:
+            text = default_text
+        if term_clean and term_clean.lower() not in text.lower():
+            text = f"{text} Focuses on the investment value of {term_clean}."
+        if len(text) > 40:
+            text = text[:40]
+        return text or f"{term_clean} adds practical investment insight."
+
+    # default to English
+    default_en = f"{term_clean} helps investors understand its impact on portfolio risk and returns."
+    if not text or len(text.split()) < 4:
+        text = default_en
+    if term_clean and term_clean.lower() not in text.lower():
+        text = f"{text} Highlighting why {term_clean} matters to investors."
+    words = text.split()
+    if len(words) > 30:
+        text = " ".join(words[:30])
+    if not text:
+        text = default_en
+    return text
 
 
 # ---------- JSON 抽取 ----------
-def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+def _extract_json(text: str, term: str = "quiz", lang: str = "zh") -> Optional[Dict[str, Any]]:
     import re
     try:
+        # 首先尝试提取 ```json 代码块
         m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text)
         if m:
-            return json.loads(m.group(1))
-        m = re.search(r"(\{[\s\S]*\})", text)
+            json_str = m.group(1)
+            result = json.loads(json_str)
+            return result
+        
+        # 尝试提取 JSON 数组格式
+        m = re.search(r"```json\s*(\[[\s\S]*?\])\s*```", text)
         if m:
-            return json.loads(m.group(1))
+            json_str = m.group(1)
+            questions_array = json.loads(json_str)
+            if isinstance(questions_array, list) and len(questions_array) > 0:
+                # 修复答案格式和清理问题文本
+                for q in questions_array:
+                    # 清理问题文本
+                    if "question" in q and isinstance(q["question"], str):
+                        question_text = q["question"]
+                        # 移除 "Answer: ..." 和 "Why: ..." 部分
+                        question_text = re.sub(r'\s*Answer:\s*[^.]*\.?\s*', ' ', question_text)
+                        question_text = re.sub(r'\s*Why:\s*[^.]*\.?\s*', ' ', question_text)
+                        # 移除多余的数字编号（如 "3. "）
+                        question_text = re.sub(r'^\d+\.\s*', '', question_text)
+                        # 清理多余的空格
+                        question_text = re.sub(r'\s+', ' ', question_text).strip()
+                        # 确保问题以问号结尾
+                        if not question_text.endswith('?'):
+                            question_text += '?'
+                        q["question"] = question_text
+                    
+                    # 修复答案格式
+                    if q.get("type") == "single" and isinstance(q.get("answer"), str):
+                        if q["answer"] in ["A", "B", "C", "D"]:
+                            q["answer"] = ord(q["answer"]) - ord("A")
+                    elif q.get("type") == "bool" and isinstance(q.get("answer"), str):
+                        q["answer"] = q["answer"].lower() in ["true", "1", "yes"]
+                    
+                    # 确保有 explanation 字段并强化教育意义
+                    if "explanation" not in q or not q["explanation"]:
+                        q["explanation"] = ""
+                    q["explanation"] = _ensure_educational_explanation(q["explanation"], term, lang)
+                
+                # 转换为期望的格式
+                result = {
+                    "card": {
+                        "term": term,
+                        "questions": questions_array,
+                        "citations": [],
+                        "lang": "en"
+                    }
+                }
+                return result
+        
+        # 然后尝试提取普通 JSON，但只取第一个完整的 JSON 对象
+        m = re.search(r"(\{[^{}]*\"card\"[^{}]*\{[^{}]*\"questions\"[^{}]*\}[^{}]*\})", text)
+        if m:
+            json_str = m.group(1)
+            result = json.loads(json_str)
+            return result
+        
+        # 如果还是失败，尝试提取任何看起来像 JSON 的内容
+        m = re.search(r"(\{[\s\S]*?\"questions\"[\s\S]*?\})", text)
+        if m:
+            json_str = m.group(1)
+            result = json.loads(json_str)
+            return result
+        
+        return None
     except Exception:
         return None
-    return None
 
 
-# ---------- 核心 API ----------
+# ---------- 答案一致性检查函数 ----------
+def _fix_answer_consistency(questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    检查并修正答案与解释的一致性
+    """
+    fixed_questions = []
+    for q in questions:
+        if q.get("type") == "single" and "options" in q and "explanation" in q:
+            explanation = q["explanation"].lower()
+            options = q["options"]
+            current_answer = q["answer"]
+            
+            # 1. 检查解释中是否包含否定词（Yes/No 问题）
+            has_negative = any(word in explanation for word in ["no", "not", "doesn't", "don't", "false", "incorrect", "wrong"])
+            
+            if has_negative and current_answer == 0 and len(options) > 1:
+                # 查找 "No" 选项
+                no_index = None
+                for i, option in enumerate(options):
+                    if option.lower().strip() in ["no", "false", "incorrect"]:
+                        no_index = i
+                        break
+                
+                if no_index is not None:
+                    print(f"[DEBUG] Fixing Yes/No consistency: {q.get('question')}")
+                    print(f"[DEBUG] Original answer: {current_answer} ({options[current_answer]})")
+                    print(f"[DEBUG] Explanation: {explanation}")
+                    print(f"[DEBUG] New answer: {no_index} ({options[no_index]})")
+                    
+                    q["answer"] = no_index
+            elif not has_negative and current_answer == 1 and len(options) > 1:
+                # 查找 "Yes" 选项
+                yes_index = None
+                for i, option in enumerate(options):
+                    if option.lower().strip() in ["yes", "true", "correct"]:
+                        yes_index = i
+                        break
+                
+                if yes_index is not None:
+                    print(f"[DEBUG] Fixing Yes/No consistency: {q.get('question')}")
+                    print(f"[DEBUG] Original answer: {current_answer} ({options[current_answer]})")
+                    print(f"[DEBUG] Explanation: {explanation}")
+                    print(f"[DEBUG] New answer: {yes_index} ({options[yes_index]})")
+                    
+                    q["answer"] = yes_index
+            
+            # 2. 检查解释中的关键概念与选项的匹配度
+            else:
+                # 提取解释中的关键概念
+                explanation_concepts = []
+                for option in options:
+                    option_text = option.lower().strip()
+                    # 移除选项前缀（如 "A. ", "B. "）
+                    if option_text.startswith(('a. ', 'b. ', 'c. ', 'd. ')):
+                        option_text = option_text[3:]
+                    
+                    # 检查解释中是否包含这个选项的关键词
+                    option_words = option_text.split()
+                    for word in option_words:
+                        if len(word) > 3 and word in explanation:  # 只匹配长度>3的单词
+                            explanation_concepts.append((option_text, options.index(option)))
+                
+                # 如果找到匹配的概念，且当前答案不匹配
+                if explanation_concepts:
+                    best_match = explanation_concepts[0]  # 取第一个匹配
+                    best_option_text, best_index = best_match
+                    
+                    if best_index != current_answer:
+                        print(f"[DEBUG] Fixing concept consistency: {q.get('question')}")
+                        print(f"[DEBUG] Original answer: {current_answer} ({options[current_answer]})")
+                        print(f"[DEBUG] Explanation: {explanation}")
+                        print(f"[DEBUG] Best match: {best_index} ({options[best_index]})")
+                        print(f"[DEBUG] Matched concept: {best_option_text}")
+                        
+                        q["answer"] = best_index
+        
+        fixed_questions.append(q)
+    
+    return fixed_questions
+
+
+# ---------- 题目类型修正函数 ----------
+def _fix_question_types(questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    修正题目类型，确保选择疑问句使用单选题而不是判断题
+    """
+    fixed_questions = []
+    for q in questions:
+        question_text = q.get("question", "").lower()
+        
+        # 检查是否包含选择疑问句模式
+        has_or_choice = (
+            " or " in question_text or 
+            "before or after" in question_text or
+            "true or false" in question_text or
+            "yes or no" in question_text
+        )
+        
+        # 如果是判断题但包含选择疑问句，转换为单选题
+        if q.get("type") == "bool" and has_or_choice:
+            print(f"[DEBUG] Converting bool question to single: {q.get('question')}")
+            
+            # 根据问题内容生成合适的选项
+            if "before or after" in question_text:
+                options = ["Before", "After"]
+                answer = 0 if q.get("answer") is True else 1
+            elif "true or false" in question_text:
+                options = ["True", "False"]
+                answer = 0 if q.get("answer") is True else 1
+            elif "yes or no" in question_text:
+                options = ["Yes", "No"]
+                answer = 0 if q.get("answer") is True else 1
+            else:
+                # 通用情况，从问题中提取选项
+                if " or " in question_text:
+                    parts = question_text.split(" or ")
+                    if len(parts) >= 2:
+                        options = [parts[0].strip().title(), parts[1].strip().title()]
+                        answer = 0 if q.get("answer") is True else 1
+                    else:
+                        options = ["Option A", "Option B"]
+                        answer = 0
+                else:
+                    options = ["Yes", "No"]
+                    answer = 0 if q.get("answer") is True else 1
+            
+            # 创建新的单选题
+            fixed_q = {
+                "type": "single",
+                "question": q.get("question"),
+                "options": options,
+                "answer": answer,
+                "explanation": q.get("explanation", "Explanation unavailable")
+            }
+            fixed_questions.append(fixed_q)
+        else:
+            # 保持原题目不变
+            fixed_questions.append(q)
+    
+    return fixed_questions
+
+
+# ---------- 核心生成函数 ----------
 def generate_quiz_card(
     term: str,
-    *,
     language: str = "zh",
-    teach_db_dir: Optional[str] = None,
-    llm: Optional[Any] = None,
     max_questions: int = 3,
-    prefer_types: Optional[List[str]] = None,    # 例如 ["single","bool"]
+    prefer_types: List[str] = None,
+    teach_db_dir: Optional[str] = None,
+    llm = None,
+    context_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    生成“测验卡（Quiz Card）”：2–3 道单选/判断，附简短解析。
-    - 若提供 teach_db/，会检索上下文辅助出题；
-    - 若无 LLM，会返回“通用测验”骨架卡（围绕学习方法和基本陷阱，避免杜撰事实）。
+    生成测验卡
+    
+    Args:
+        term: 主题/术语
+        language: 语言 ("zh" 或 "en")
+        max_questions: 最大题目数
+        prefer_types: 偏好类型 ["single", "bool"]
+        teach_db_dir: 教学数据库目录
+        llm: LLM 实例
+    
+    Returns:
+        测验卡字典
     """
-    term = (term or "").strip()
-    if not term:
-        return {
-            "card": {"term":"", "questions":[], "citations":[], "lang": language},
-            "meta": {"used_rag": False, "retrieved": 0, "note": "empty_term"}
-        }
-
-    prefer_types = prefer_types or ["single", "bool"]
-    max_questions = max(2, min(3, int(max_questions or 3)))
-
+    if prefer_types is None:
+        prefer_types = ["single", "bool"]
+    
+    # 加载 RAG 检索器
     retriever, rag_ok = _load_teach_vs(teach_db_dir)
-    docs = retriever.get_relevant_documents(term) if (retriever and rag_ok) else []
-    context = _format_docs_for_prompt(docs, max_chars=2800) if docs else ""
+    if rag_ok and retriever:
+        docs = retriever.get_relevant_documents(term)
+    else:
+        docs = []
+    
+    if context_override:
+        context = str(context_override)
+    else:
+        context = _format_docs_for_prompt(docs, max_chars=2800) if docs else ""
     citations = _collect_citations(docs, limit=5)
 
+    # 构建 LLM
     chat = llm or build_default_llm()
     lang = (language or "zh").lower()
 
+    output_lang_label = "Chinese" if lang.startswith("zh") else "English"
+    lang_code = "zh" if lang.startswith("zh") else "en"
     sys_text = (
-        "你是投资教学助教。基于上下文为指定主题生成严格JSON的“测验卡”："
-        "题目 2–3 道；类型仅限 single(单选，4项且唯一正确) 或 bool(判断)。"
-        "答案：单选用正确选项索引（0-3），判断用 true/false。"
-        "解析须 ≤40字，强调记忆点。禁止编造事实/URL。"
-        "JSON 结构示例："
-        "```json\n{\n  \"card\": {\n    \"term\":\"...\",\n    \"questions\":[{\"type\":\"single\",\"question\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"answer\":2,\"explanation\":\"...\"}],\n    \"citations\":[{\"title\":\"\",\"url\":\"\",\"source\":\"\"}],\n    \"lang\":\"zh\"\n  }\n}\n```"
-        if lang.startswith("zh") else
-        "You are a finance tutor. Produce a strict-JSON quiz card with 2–3 questions (single-choice or true/false). "
-        "Single-choice has 4 options and a single correct index (0-3). Bool uses true/false. "
-        "Explanations ≤30 words, focus on memory hooks. No fabrication/URLs."
+        "You are a finance education assistant. Every question must stay within finance, investing, capital markets, or corporate finance."
+        "Produce a strict-JSON quiz card that obeys these rules:"
+        "- Include 2–3 questions only; allowed types are \"single\" (four options, exactly one correct index 0-3) or \"bool\" (true/false)."
+        "- If the prompt is a choice question (e.g., includes \"or\"), you must use the \"single\" type with explicit options; only clear yes/no prompts may use \"bool\"."
+        "- Each explanation must be ≤40 characters/30 words and highlight why the concept matters for investment decisions, risk management, or portfolio construction."
+        "- Generate the content in the requested output language and set the JSON \"lang\" field to \"zh\" or \"en\" accordingly."
+        "- Before responding, validate that the JSON is well-formed (fields, data types, option counts, answer indices) and fix any issues."
+        "- Do not fabricate facts or URLs. Return exactly one ```json``` code block using the schema below:"
+        "```json\n{\n  \"card\": {\n    \"term\": \"...\",\n    \"questions\": [\n      {\n        \"type\": \"single\",\n        \"question\": \"...\",\n        \"options\": [\"A\",\"B\",\"C\",\"D\"],\n        \"answer\": 2,\n        \"explanation\": \"...\"\n      }\n    ],\n    \"citations\": [{\"title\": \"\", \"url\": \"\", \"source\": \"\"}],\n    \"lang\": \"zh\"\n  }\n}\n```"
     )
     human_text = (
-        f"【主题】{term}\n【上下文】\n{context}\n【题量】≤{max_questions}\n【类型优先】{','.join(prefer_types)}\n"
-        "仅返回一个 ```json fenced block```。"
-        if lang.startswith("zh") else
-        f"[TERM] {term}\n[CONTEXT]\n{context}\n[MAX_QUESTIONS] {max_questions}\n[PREFERRED_TYPES] {','.join(prefer_types)}\nReturn one ```json fenced block```."
+        f"[TERM] {term}\n"
+        f"[OUTPUT_LANGUAGE] {output_lang_label} (set JSON \"lang\" = \"{lang_code}\")\n"
+        f"[CONTEXT]\n{context}\n"
+        f"[MAX_QUESTIONS] {max_questions}\n"
+        f"[PREFERRED_TYPES] {','.join(prefer_types)}\n"
+        "Return exactly one ```json``` fenced block and nothing else."
     )
 
     if (chat is not None) and _LC_CORE_AVAILABLE:
@@ -203,116 +443,139 @@ def generate_quiz_card(
         try:
             ai = chat.invoke(msgs)
             raw = getattr(ai, "content", "") or ""
-            parsed = _extract_json(raw) or {}
-            card = parsed.get("card", {})
-            if not isinstance(card, dict):
-                card = {}
-            # 兜底字段
-            card.setdefault("term", term)
-            qs = card.get("questions") or []
-            # 只留 2–3 道
-            card["questions"] = qs[:max_questions]
-            card.setdefault("citations", citations)
-            card.setdefault("lang", "zh" if lang.startswith("zh") else "en")
-            return {"card": card, "meta": {"used_rag": bool(docs), "retrieved": len(docs)}}
+            print(f"[DEBUG] LLM raw response: {raw[:500]}...")
+            
+            parsed = _extract_json(raw, term, lang) or {}
+            print(f"[DEBUG] Parsed JSON: {parsed}")
+            if not parsed:
+                raise Exception("JSON parsing failed")
+            
+            # 确保有 card 字段
+            if "card" not in parsed:
+                raise Exception("Missing card field")
+            
+            card = parsed["card"]
+            if "questions" not in card:
+                raise Exception("Missing questions field")
+            
+            # 确保每个题目都有必要字段，并修复答案格式
+            for q in card["questions"]:
+                if "type" not in q or "question" not in q:
+                    raise Exception("Invalid question format")
+                if q["type"] == "single" and "options" not in q:
+                    raise Exception("Invalid single choice question: missing options")
+                if q["type"] == "single" and "answer" not in q and "correct_index" not in q:
+                    raise Exception("Invalid single choice question: missing answer/correct_index")
+                if q["type"] == "bool" and "answer" not in q:
+                    raise Exception("Invalid bool question")
+                
+                # 清理问题文本，移除多余的答案和解释
+                question_text = q["question"]
+                if isinstance(question_text, str):
+                    # 移除 "Answer: ..." 和 "Why: ..." 部分
+                    import re
+                    # 移除 Answer: 和 Why: 及其后面的内容
+                    question_text = re.sub(r'\s*Answer:\s*[^.]*\.?\s*', ' ', question_text)
+                    question_text = re.sub(r'\s*Why:\s*[^.]*\.?\s*', ' ', question_text)
+                    # 移除多余的数字编号（如 "3. "）
+                    question_text = re.sub(r'^\d+\.\s*', '', question_text)
+                    # 清理多余的空格
+                    question_text = re.sub(r'\s+', ' ', question_text).strip()
+                    # 确保问题以问号结尾
+                    if not question_text.endswith('?'):
+                        question_text += '?'
+                    q["question"] = question_text
+                
+                # 修复答案格式
+                if q["type"] == "single" and "answer" in q and isinstance(q["answer"], str):
+                    if q["answer"] in ["A", "B", "C", "D"]:
+                        q["answer"] = ord(q["answer"]) - ord("A")
+                elif q["type"] == "single" and "answer" not in q and "correct_index" in q:
+                    try:
+                        q["answer"] = int(q.pop("correct_index"))
+                    except Exception as exc:
+                        raise Exception(f"Invalid correct_index format: {exc}")
+                elif q["type"] == "bool" and isinstance(q["answer"], str):
+                    q["answer"] = q["answer"].lower() in ["true", "1", "yes"]
+                
+                # 确保有 explanation 字段并强化教育意义
+                if "explanation" not in q or not q["explanation"]:
+                    q["explanation"] = ""
+                q["explanation"] = _ensure_educational_explanation(q["explanation"], term, lang)
+            
+            # 修正题目类型，确保选择疑问句使用单选题
+            card["questions"] = _fix_question_types(card["questions"])
+            
+            # 检查并修正答案与解释的一致性
+            card["questions"] = _fix_answer_consistency(card["questions"])
+            
+            return {
+                "card": card,
+                "meta": {
+                    "used_rag": rag_ok,
+                    "retrieved": len(docs),
+                    "note": "Generated with LLM"
+                }
+            }
         except Exception:
-            pass
-
-    # ---- 无 LLM 骨架：通用但不涉具体事实 ----
-    zh = lang.startswith("zh")
-    if zh:
-        skeleton = [
-            {
+            pass  # 降级到骨架卡
+    
+    # 降级：返回骨架卡
+    skeleton_questions = []
+    for i in range(min(max_questions, 3)):
+        q_type = random.choice(prefer_types) if prefer_types else "single"
+        if q_type == "single":
+            skeleton_questions.append({
+                "type": "single",
+                "question": f"In an investing context, multiple-choice question {i+1} about {term}?",
+                "options": ["Option A", "Option B", "Option C", "Option D"],
+                "answer": 0,
+                "explanation": _ensure_educational_explanation("", term, lang)
+            })
+        else:  # bool
+            skeleton_questions.append({
                 "type": "bool",
-                "question": f"判断：精确定义与直觉类比都有助于掌握“{term}”。",
+                "question": f"In finance, is statement {i+1} about {term} correct?",
                 "answer": True,
-                "explanation": "双轨记忆：先准确定义，再用类比巩固。",
-            },
-            {
-                "type": "single",
-                "question": f"关于“{term}”，哪项做法最能避免误解？",
-                "options": ["只记公式", "结合反例", "只看单一区间", "忽略单位"],
-                "answer": 1,
-                "explanation": "反例能暴露边界条件，防止过度泛化。",
-            },
-            {
-                "type": "single",
-                "question": "学习效果最可能提升的是哪一项？",
-                "options": ["定义", "直觉", "为何重要", "以上皆是"],
-                "answer": 3,
-                "explanation": "三件套能构建完整语义网络。",
-            },
-        ]
-    else:
-        skeleton = [
-            {
-                "type": "bool",
-                "question": f"True/False: Both precise definition and intuition help learn '{term}'.",
-                "answer": True,
-                "explanation": "Dual coding: definition + analogy boosts recall.",
-            },
-            {
-                "type": "single",
-                "question": f"For '{term}', which helps avoid misconceptions most?",
-                "options": ["Memorize formula only", "Study counterexamples", "Use a single time window", "Ignore units"],
-                "answer": 1,
-                "explanation": "Counterexamples reveal edge cases.",
-            },
-            {
-                "type": "single",
-                "question": "Which improves retention the most?",
-                "options": ["Definition", "Intuition", "Why it matters", "All of the above"],
-                "answer": 3,
-                "explanation": "The trio forms a complete schema.",
-            },
-        ]
-
-    card = {
-        "term": term,
-        "questions": skeleton[:max_questions],
-        "citations": citations,
-        "lang": "zh" if zh else "en",
+                "explanation": _ensure_educational_explanation("", term, lang)
+            })
+    
+    return {
+        "card": {
+            "term": term,
+            "questions": skeleton_questions,
+            "citations": citations,
+            "lang": lang
+        },
+        "meta": {
+            "used_rag": rag_ok,
+            "retrieved": len(docs),
+            "note": "Skeleton card (no LLM available)"
+        }
     }
-    return {"card": card, "meta": {"used_rag": bool(docs), "retrieved": len(docs), "note": "no_llm_fallback"}}
 
 
-# ---------- LangChain 工具工厂 ----------
-def get_quiz_tool(
-    *,
-    teach_db_dir: Optional[str] = None,
-    llm: Optional[Any] = None,
-    name: str = "quiz_card",
-    description: str = "生成测验卡（2–3道单选/判断，附简短解析）。输入 term:str, language?:'zh'|'en', options_json?:str。",
-):
-    """
-    返回 LangChain StructuredTool；options_json 可传：
-      {"max_questions": 3, "prefer_types": ["single","bool"]}
-    """
-    def _tool(term: str, language: str = "zh", options_json: Optional[str] = None) -> str:
-        opts = {}
-        try:
-            opts = json.loads(options_json) if options_json else {}
-        except Exception:
-            opts = {}
-        res = generate_quiz_card(
-            term=term,
-            language=language,
-            teach_db_dir=teach_db_dir,
-            llm=llm,
-            max_questions=int(opts.get("max_questions", 3)),
-            prefer_types=opts.get("prefer_types") or ["single","bool"],
-        )
-        return json.dumps(res, ensure_ascii=False)
-
-    if StructuredTool is None:
-        class _CallableTool:
-            __name__ = name
-            def __call__(self, term: str, language: str = "zh", options_json: Optional[str] = None):
-                return _tool(term, language, options_json)
-        return _CallableTool()
-
+# ---------- LangChain 工具包装 ----------
+def get_quiz_tool() -> Optional[StructuredTool]:
+    """返回 LangChain StructuredTool"""
+    if not _LC_CORE_AVAILABLE:
+        return None
+    
+    def _quiz_tool(term: str, language: str = "zh", max_questions: int = 3) -> str:
+        """生成测验卡工具"""
+        result = generate_quiz_card(term, language, max_questions)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    
     return StructuredTool.from_function(
-        func=_tool,
-        name=name,
-        description=description,
+        func=_quiz_tool,
+        name="quiz_tool",
+        description="生成投资主题的测验卡，包含2-3道单选或判断题",
+        args_schema=None
     )
+
+
+# ---------- 主程序（测试用） ----------
+if __name__ == "__main__":
+    # 测试
+    result = generate_quiz_card("股票", "zh", 3)
+    print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -234,32 +234,32 @@ def generate_concept_card(
     # Build prompt
     lang = (language or "zh").lower()
     sys_text = (
-        "你是一名投资教学助教。基于提供的上下文，用指定语言生成严格JSON的“概念卡（Concept Card）”。"
-        if lang.startswith("zh") else
-        "You are a finance tutor. Using the given context, produce a strict-JSON Concept Card."
+        "You are a finance education assistant. Using the supplied context, generate a strict-JSON \"Concept Card\" in the requested language."
+        "The card must stay fact-based and highlight why the concept matters for investors."
     )
     schema = (
-        "```json\n{\n  \"card\": {\n    \"term\": \"...\"," 
-        "\n    \"definition\": \"<=80字精确定义，不可编造\",\n    \"intuition\": \"<=80字直觉理解/类比\",\n"
-        "    \"why_it_matters\": \"<=80字说明该概念的用途/影响\",\n"
+        "```json\n{\n  \"card\": {\n    \"term\": \"...\",\n"
+        "    \"definition\": \"<=80 characters precise definition, no fabrication\",\n"
+        "    \"intuition\": \"<=80 characters intuition or analogy\",\n"
+        "    \"why_it_matters\": \"<=80 characters explaining relevance\",\n"
         "    \"keywords\": [\"...\"],\n"
-        "    \"citations\": [{\"title\":\"\",\"url\":\"\",\"source\":\"\"}],\n    \"lang\": \"zh\"\n  }\n}\n```"
+        "    \"citations\": [{\"title\":\"\",\"url\":\"\",\"source\":\"\"}],\n"
+        "    \"lang\": \"zh\"\n  }\n}\n```"
         if lang.startswith("zh") else
-        "```json\n{\n  \"card\": {\n    \"term\": \"...\"," 
-        "\n    \"definition\": \"<=40 words precise definition\",\n    \"intuition\": \"<=40 words intuition/metaphor\",\n"
+        "```json\n{\n  \"card\": {\n    \"term\": \"...\",\n"
+        "    \"definition\": \"<=40 words precise definition\",\n"
+        "    \"intuition\": \"<=40 words intuition/metaphor\",\n"
         "    \"why_it_matters\": \"<=50 words on relevance\",\n"
         "    \"keywords\": [\"...\"],\n"
-        "    \"citations\": [{\"title\":\"\",\"url\":\"\",\"source\":\"\"}],\n    \"lang\": \"en\"\n  }\n}\n```"
+        "    \"citations\": [{\"title\":\"\",\"url\":\"\",\"source\":\"\"}],\n"
+        "    \"lang\": \"en\"\n  }\n}\n```"
     )
 
     human_text = (
-        f"【术语】{term}\n"
-        f"【追问】{user_question or ''}\n"
-        f"【上下文】\n{context}\n"
-        "必须只输出一个 ```json fenced block```，严禁编造事实和URL；如无URL留空。"
-        if lang.startswith("zh") else
-        f"[TERM] {term}\n[QUESTION] {user_question or ''}\n[CONTEXT]\n{context}\n"
-        "Return only one ```json fenced block```. No fabrication; leave URL empty if unknown."
+        f"[TERM] {term}\n"
+        f"[FOLLOW_UP] {user_question or ''}\n"
+        f"[CONTEXT]\n{context}\n"
+        "Return a single ```json``` fenced block. Do not fabricate facts or URLs; leave URL empty when unknown."
     )
 
     if (chat is not None) and _LC_CORE_AVAILABLE:
@@ -283,9 +283,9 @@ def generate_concept_card(
     return {
         "card": {
             "term": term,
-            "definition": f"{'依据上下文的' if context else '通用的'}简要定义（需要LLM生成）",
-            "intuition": "直觉/类比（需要LLM生成）" if lang.startswith("zh") else "Intuition/metaphor (needs LLM)",
-            "why_it_matters": "为什么重要（需要LLM生成）" if lang.startswith("zh") else "Why it matters (needs LLM)",
+            "definition": f"{'Context-aware' if context else 'Generic'} short definition (requires LLM).",
+            "intuition": "Intuition/metaphor (requires LLM)." ,
+            "why_it_matters": "Why it matters (requires LLM).",
             "keywords": [],
             "citations": citations,
             "lang": "zh" if lang.startswith("zh") else "en",
@@ -300,7 +300,7 @@ def get_concept_card_tool(
     teach_db_dir: Optional[str] = None,
     llm: Optional[Any] = None,
     name: str = "concept_card",
-    description: str = "生成概念卡（定义+直觉+为何重要）。输入: term:str, user_question?:str, language?:'zh'|'en'. 返回严格JSON。",
+    description: str = "Generate a concept card (definition + intuition + why it matters). Input: term:str, user_question?:str, language?:'zh'|'en'. Returns strict JSON.",
 ):
     """
     Returns a LangChain StructuredTool wrapping generate_concept_card for agent use.

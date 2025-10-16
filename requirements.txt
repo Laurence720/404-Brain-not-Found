@@ -1,4 +1,5 @@
 aiofiles
+asgiref
 beautifulsoup4
 cryptography
 fastapi

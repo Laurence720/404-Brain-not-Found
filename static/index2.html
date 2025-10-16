@@ -602,23 +602,27 @@
     <span class="orb o3"></span>
   </div>
 
+  <!-- Quiz Modal -->
   <div id="quizModal" class="quiz-modal">
     <div class="quiz-container">
       <div class="quiz-header">
         <h2 class="quiz-title">📚 Finance Quiz</h2>
-        <p class="quiz-term" id="quizTerm"></p>
-        <button class="quiz-close" onclick="closeQuiz()">&times;</button>
+        <p class="quiz-term" id="quizTerm">Topic: Portfolio</p>
       </div>
       <div class="quiz-content">
         <div class="quiz-progress">
           <span id="quizProgress">Question 1 / 3</span>
           <div class="progress-bar">
-            <div class="progress-fill" id="progressFill"></div>
+            <div class="progress-fill" id="progressFill" style="width: 33%"></div>
           </div>
           <span id="quizScore">Score: 0</span>
         </div>
-        <div class="quiz-question" id="quizQuestion"></div>
-        <div class="quiz-explanation" id="quizExplanation" style="display: none;"></div>
+        <div class="quiz-question" id="quizQuestion">
+          <!-- Question content will be inserted here -->
+        </div>
+        <div class="quiz-explanation" id="quizExplanation" style="display: none;">
+          <!-- Answer explanation will be inserted here -->
+        </div>
         <div class="quiz-actions">
           <button id="quizSubmit" class="btn primary" disabled>Submit Answer</button>
           <button id="quizNext" class="btn ghost" style="display: none;">Next Question</button>
@@ -1237,6 +1241,143 @@
       }
     }
 
+    function showQuiz(quizCard) {
+      console.log('Starting quiz with card:', quizCard);
+      currentQuiz = quizCard;
+      currentQuestionIndex = 0;
+      quizScore = 0;
+      
+      document.getElementById('quizModal').classList.add('show');
+      document.getElementById('quizTotal').textContent = quizCard.questions.length;
+      document.getElementById('quizScore').textContent = '0';
+      
+      displayQuestion();
+    }
+
+    function closeQuiz() {
+      document.getElementById('quizModal').classList.remove('show');
+      currentQuiz = null;
+      currentQuestionIndex = 0;
+      quizScore = 0;
+    }
+
+    function displayQuestion() {
+      if (!currentQuiz || currentQuestionIndex >= currentQuiz.questions.length) {
+        showQuizResults();
+        return;
+      }
+      
+      const question = currentQuiz.questions[currentQuestionIndex];
+      const questionEl = document.getElementById('quizQuestionText');
+      const optionsEl = document.getElementById('quizOptions');
+      const resultEl = document.getElementById('quizResult');
+      const nextBtn = document.getElementById('quizNext');
+      
+      // Update progress
+      document.getElementById('quizCurrent').textContent = currentQuestionIndex + 1;
+      const progress = ((currentQuestionIndex + 1) / currentQuiz.questions.length) * 100;
+      document.getElementById('quizProgressFill').style.width = progress + '%';
+      
+      // Clear previous state
+      resultEl.classList.remove('show', 'correct', 'incorrect');
+      nextBtn.style.display = 'none';
+      
+      // Set question text
+      questionEl.textContent = question.question;
+      
+      // Create options
+      optionsEl.innerHTML = '';
+      question.options.forEach((option, index) => {
+        const optionEl = document.createElement('div');
+        optionEl.className = 'quiz-option';
+        optionEl.textContent = `${String.fromCharCode(65 + index)}. ${option}`;
+        optionEl.addEventListener('click', () => selectOption(index, question));
+        optionsEl.appendChild(optionEl);
+      });
+    }
+
+    function selectOption(selectedIndex, question) {
+      const options = document.querySelectorAll('.quiz-option');
+      const isCorrect = selectedIndex === question.answer;
+      
+      // Mark selected option
+      options[selectedIndex].classList.add('selected');
+      
+      // Mark correct/incorrect
+      options.forEach((option, index) => {
+        option.style.pointerEvents = 'none';
+        if (index === question.answer) {
+          option.classList.add('correct');
+        } else if (index === selectedIndex && !isCorrect) {
+          option.classList.add('incorrect');
+        }
+      });
+      
+      // Update score
+      if (isCorrect) {
+        quizScore++;
+        document.getElementById('quizScore').textContent = quizScore;
+      }
+      
+      // Show result
+      const resultEl = document.getElementById('quizResult');
+      resultEl.classList.add('show', isCorrect ? 'correct' : 'incorrect');
+      
+      // Show explanation
+      const explanationEl = document.getElementById('quizExplanation');
+      if (explanationEl) {
+        explanationEl.textContent = question.explanation || 'No explanation available';
+        explanationEl.style.display = 'block';
+      }
+      
+      // Debug: log question data
+      console.log('Question data:', question);
+      console.log('Explanation:', question.explanation);
+      
+      // Clear previous result content
+      resultEl.innerHTML = '';
+      const resultDiv = document.createElement('div');
+      resultDiv.innerHTML = `
+        <div class="result-title">${isCorrect ? '✅ Correct!' : '❌ Incorrect'}</div>
+        <div class="result-explanation">${question.explanation || 'No explanation available'}</div>
+      `;
+      resultEl.appendChild(resultDiv);
+      
+      // Show next button
+      const nextBtn = document.getElementById('quizNext');
+      if (currentQuestionIndex < currentQuiz.questions.length - 1) {
+        nextBtn.textContent = 'Next Question';
+        nextBtn.style.display = 'inline-flex';
+      } else {
+        nextBtn.textContent = 'View Results';
+        nextBtn.style.display = 'inline-flex';
+      }
+    }
+
+    function nextQuestion() {
+      currentQuestionIndex++;
+      if (currentQuestionIndex < currentQuiz.questions.length) {
+        displayQuestion();
+      } else {
+        showQuizResults();
+      }
+    }
+
+    function showQuizResults() {
+      const questionEl = document.getElementById('quizQuestion');
+      const nextBtn = document.getElementById('quizNext');
+      
+      questionEl.innerHTML = `
+        <div class="quiz-results">
+          <h3>Quiz Complete!</h3>
+          <p>You answered ${quizScore} of ${currentQuiz.questions.length} questions correctly</p>
+          <p>Accuracy: ${Math.round((quizScore / currentQuiz.questions.length) * 100)}%</p>
+        </div>
+      `;
+      
+      nextBtn.style.display = 'none';
+    }
+
     async function sendNonStreaming(payload) {
       const res = await fetch(API_URL, {
         method: 'POST',
@@ -1599,8 +1740,8 @@
         </div>
         <div style="font-size: 14px; color: var(--muted);">
           ${percentage >= 70 ? 'Excellent work—you understand this topic well.' : 
-            percentage >= 50 ? 'Nice progress—keep practicing to build confidence.' : 
-            'Consider revisiting the material to strengthen your understanding.'}
+            percentage >= 50 ? 'Good job—keep practicing to build confidence.' : 
+            'Consider reviewing the material to strengthen your understanding.'}
         </div>
       `;
       
@@ -1661,5 +1802,36 @@
       }, 900); // show overlay briefly before fading
     });
   </script>
+  <!-- Quiz Modal -->
+  <div id="quizModal" class="quiz-modal">
+    <div class="quiz-content">
+      <div class="quiz-header">
+        <div class="quiz-title">
+          📚 Finance Quiz
+        </div>
+        <button class="quiz-close" onclick="closeQuiz()">&times;</button>
+      </div>
+      
+      <div class="quiz-progress">
+        <span class="quiz-progress-text">Question <span id="quizCurrent">1</span>/<span id="quizTotal">3</span></span>
+        <div class="quiz-progress-bar">
+          <div class="quiz-progress-fill" id="quizProgressFill"></div>
+        </div>
+        <span class="quiz-score">Score: <span id="quizScore">0</span></span>
+      </div>
+      
+      <div class="quiz-question" id="quizQuestion">
+        <div class="quiz-question-text" id="quizQuestionText">Loading...</div>
+        <div class="quiz-options" id="quizOptions"></div>
+        <div class="quiz-result" id="quizResult"></div>
+      </div>
+      
+      <div class="quiz-buttons">
+        <button class="quiz-button secondary" onclick="closeQuiz()">Close</button>
+        <button class="quiz-button primary" id="quizNext" onclick="nextQuestion()" style="display: none;">Next Question</button>
+      </div>
+    </div>
+  </div>
+
   </body>
 </html>

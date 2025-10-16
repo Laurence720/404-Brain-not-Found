@@ -68,13 +68,13 @@ RISK_POLICIES: Dict[str, Dict[str, Any]] = {
     "low": {
         "instrument_set": ["ETF","STOCK"],
         "core_etfs": ["VTI","VOO","SCHX","XLV","XLP","AGG","IEF"],
-        "max_single_weight": 0.10,
+        "max_single_weight": 0.12,
         "sector_cap": 0.25,
-        "min_market_cap_usd": 20e9,     # optional if you provide market_caps
-        "min_adv_usd": 80e6,            # optional if you provide adv_usd
-        "beta_max": 1.0,
-        "ann_vol_max": 0.22,
-        "max_drawdown_6m": 0.25,
+        "min_market_cap_usd": 15e9,     # optional if you provide market_caps
+        "min_adv_usd": 50e6,            # optional if you provide adv_usd
+        "beta_max": 1.35,
+        "ann_vol_max": 0.38,
+        "max_drawdown_6m": 0.36,
         "allow_leverage": False,
         "hedge_etfs": ["SHY","IEF"],
     },
@@ -83,11 +83,11 @@ RISK_POLICIES: Dict[str, Dict[str, Any]] = {
         "core_etfs": ["VTI","QQQ","IWM"],
         "max_single_weight": 0.15,
         "sector_cap": 0.35,
-        "min_market_cap_usd": 5e9,
-        "min_adv_usd": 30e6,
-        "beta_max": 1.3,
-        "ann_vol_max": 0.35,
-        "max_drawdown_6m": 0.35,
+        "min_market_cap_usd": 3e9,
+        "min_adv_usd": 20e6,
+        "beta_max": 1.45,
+        "ann_vol_max": 0.40,
+        "max_drawdown_6m": 0.40,
         "allow_leverage": False,
         "hedge_etfs": [],
     },
@@ -96,10 +96,10 @@ RISK_POLICIES: Dict[str, Dict[str, Any]] = {
         "core_etfs": ["QQQ","IWM"],
         "max_single_weight": 0.20,
         "sector_cap": 0.50,
-        "min_market_cap_usd": 1e9,
-        "min_adv_usd": 10e6,
-        "beta_min": 1.0,
-        "ann_vol_min": 0.22,
+        "min_market_cap_usd": 5e8,
+        "min_adv_usd": 5e6,
+        "beta_min": 0.9,
+        "ann_vol_min": 0.18,
         "allow_leverage": False,
         "hedge_etfs": [],
     },
@@ -292,11 +292,14 @@ def apply_risk_policy(
     kept: List[str] = []
     dropped: Dict[str, str] = {}
 
+    fallback_candidates: List[tuple[int, str]] = []
     for t in tickers:
         m = risk_metrics.get(t, {}) if risk_metrics else {}
         ann_vol = m.get("ann_vol")
         beta = m.get("beta")
         mdd = m.get("mdd_6m")
+        score_fit = _risk_fit_score(m, risk_level)
+        fallback_candidates.append((score_fit, t))
 
         # Optional size/liquidity constraints
         if market_caps and policy.get("min_market_cap_usd") and market_caps.get(t, float("inf")) < policy["min_market_cap_usd"]:
@@ -323,8 +326,20 @@ def apply_risk_policy(
 
         kept.append(t)
 
+    fallback_used = False
+    fallback_selected: List[str] = []
+    if not kept:
+        fallback_candidates.sort(key=lambda item: item[0], reverse=True)
+        fallback_selected = [t for _, t in fallback_candidates if isinstance(t, str)]
+        fallback_selected = fallback_selected[:3] if fallback_selected else []
+        if fallback_selected:
+            kept.extend(fallback_selected)
+            for t in fallback_selected:
+                dropped.pop(t, None)
+            fallback_used = True
+
     # Backfill for conservative portfolios
-    if (risk_level or "").lower() == "low" and len(kept) < 3:
+    if (risk_level or "").lower() == "low" and len(kept) < 3 and not fallback_used:
         for etf in policy.get("core_etfs", []):
             if etf not in kept:
                 kept.append(etf)
@@ -332,7 +347,11 @@ def apply_risk_policy(
         seen = set()
         kept = [x for x in kept if not (x in seen or seen.add(x))][:8]
 
-    return {"kept": kept, "dropped": dropped, "policy": policy}
+    result = {"kept": kept, "dropped": dropped, "policy": policy}
+    if fallback_used:
+        result["fallback_used"] = True
+        result["fallback_candidates"] = fallback_selected
+    return result
 
 
 # ------------------------------------------------------
